@@ -1,9 +1,12 @@
+use std::fs::File;
+use std::io::BufReader;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::counter::referenced_counter::HwMetricRefCounter;
 use io::file_operations::atomic_save_json;
+use itertools::Itertools;
 use lz4_flex::compress_prepend_size;
 use memory::mmap_type;
 use parking_lot::RwLock;
@@ -158,7 +161,7 @@ impl<V: Blob> Gridstore<V> {
 
         // read config file first
         let config_path = path.join(CONFIG_FILENAME);
-        let config_file = std::fs::File::open(&config_path).map_err(|err| err.to_string())?;
+        let config_file = BufReader::new(File::open(&config_path).map_err(|err| err.to_string())?);
         let config: StorageConfig =
             serde_json::from_reader(config_file).map_err(|err| err.to_string())?;
 
@@ -195,15 +198,50 @@ impl<V: Blob> Gridstore<V> {
     fn read_from_pages(
         &self,
         start_page_id: PageId,
+        block_offset: BlockOffset,
+        length: u32,
+    ) -> Vec<u8> {
+        self.read_from_pages_with_read_fn(
+            start_page_id,
+            block_offset,
+            length,
+            |page, block_offset: BlockOffset, length: u32, block_size_bytes: usize| {
+                page.read_value(block_offset, length, block_size_bytes)
+            },
+        )
+    }
+
+    /// Read raw value from the pages. Considering that they can span more than one page.
+    fn read_from_pages_sequential(
+        &self,
+        start_page_id: PageId,
+        block_offset: BlockOffset,
+        length: u32,
+    ) -> Vec<u8> {
+        self.read_from_pages_with_read_fn(
+            start_page_id,
+            block_offset,
+            length,
+            |page, block_offset: BlockOffset, length: u32, block_size_bytes: usize| {
+                page.read_value_sequential(block_offset, length, block_size_bytes)
+            },
+        )
+    }
+
+    fn read_from_pages_with_read_fn(
+        &self,
+        start_page_id: PageId,
         mut block_offset: BlockOffset,
         mut length: u32,
+        read_fn: impl Fn(&Page, BlockOffset, u32, usize) -> (&[u8], usize),
     ) -> Vec<u8> {
         let mut raw_sections = Vec::with_capacity(length as usize);
 
         for page_id in start_page_id.. {
             let page = &self.pages[page_id as usize];
             let (raw, unread_bytes) =
-                page.read_value(block_offset, length, self.config.block_size_bytes);
+                read_fn(page, block_offset, length, self.config.block_size_bytes);
+
             raw_sections.extend(raw);
 
             if unread_bytes == 0 {
@@ -217,7 +255,7 @@ impl<V: Blob> Gridstore<V> {
         raw_sections
     }
 
-    /// Get the value for a given point offset
+    /// Get the value for a given point offset, from the random mmap
     pub fn get_value(
         &self,
         point_offset: PointOffset,
@@ -230,6 +268,28 @@ impl<V: Blob> Gridstore<V> {
         } = self.get_pointer(point_offset)?;
 
         let raw = self.read_from_pages(page_id, block_offset, length);
+
+        hw_counter.payload_io_read_counter().incr_delta(raw.len());
+
+        let decompressed = self.decompress(raw);
+        let value = V::from_bytes(&decompressed);
+
+        Some(value)
+    }
+
+    /// Get the value for a given point offset, from the sequential mmap
+    pub fn get_value_sequential(
+        &self,
+        point_offset: PointOffset,
+        hw_counter: &HardwareCounterCell,
+    ) -> Option<V> {
+        let ValuePointer {
+            page_id,
+            block_offset,
+            length,
+        } = self.get_pointer(point_offset)?;
+
+        let raw = self.read_from_pages_sequential(page_id, block_offset, length);
 
         hw_counter.payload_io_read_counter().incr_delta(raw.len());
 
@@ -482,7 +542,7 @@ impl<V: Blob> Gridstore<V> {
                      block_offset,
                      length,
                  }| {
-                    let raw = self.read_from_pages(page_id, block_offset, length);
+                    let raw = self.read_from_pages_sequential(page_id, block_offset, length);
                     let decompressed = self.decompress(raw);
                     V::from_bytes(&decompressed)
                 },
@@ -513,14 +573,19 @@ impl<V> Gridstore<V> {
 
         // update all free blocks in the bitmask
         bitmask_guard.with_upgraded(|guard| {
-            for pointer in old_pointers {
-                // TODO: mark in batch? so that we update the gaps less times.
-                guard.mark_blocks(
-                    pointer.page_id,
-                    pointer.block_offset,
-                    Self::blocks_for_value(pointer.length as usize, self.config.block_size_bytes),
-                    false,
-                );
+            for (page_id, pointer_group) in
+                &old_pointers.into_iter().chunk_by(|pointer| pointer.page_id)
+            {
+                let local_ranges = pointer_group.map(|pointer| {
+                    let start = pointer.block_offset;
+                    let end = pointer.block_offset
+                        + Self::blocks_for_value(
+                            pointer.length as usize,
+                            self.config.block_size_bytes,
+                        );
+                    start as usize..end as usize
+                });
+                guard.mark_blocks_batch(page_id, local_ranges, false);
             }
         });
         bitmask_guard.flush()?;
@@ -731,43 +796,40 @@ mod tests {
     fn test_update_single_payload() {
         let (_dir, mut storage) = empty_storage();
 
-        let mut payload = Payload::default();
-        payload.0.insert(
-            "key".to_string(),
-            serde_json::Value::String("value".to_string()),
-        );
         let hw_counter = HardwareCounterCell::new();
         let hw_counter_ref = hw_counter.ref_payload_io_write_counter();
+        let put_payload =
+            |storage: &mut Gridstore<Payload>, payload_value: &str, expected_block_offset: u32| {
+                let mut payload = Payload::default();
+                payload.0.insert(
+                    "key".to_string(),
+                    serde_json::Value::String(payload_value.to_string()),
+                );
 
-        storage.put_value(0, &payload, hw_counter_ref).unwrap();
-        assert_eq!(storage.pages.len(), 1);
-        assert_eq!(storage.tracker.read().mapping_len(), 1);
+                storage.put_value(0, &payload, hw_counter_ref).unwrap();
+                assert_eq!(storage.pages.len(), 1);
+                assert_eq!(storage.tracker.read().mapping_len(), 1);
 
-        let page_mapping = storage.get_pointer(0).unwrap();
-        assert_eq!(page_mapping.page_id, 0); // first page
-        assert_eq!(page_mapping.block_offset, 0); // first cell
+                let page_mapping = storage.get_pointer(0).unwrap();
+                assert_eq!(page_mapping.page_id, 0); // first page
+                assert_eq!(page_mapping.block_offset, expected_block_offset);
 
-        let hw_counter = HardwareCounterCell::new();
-        let stored_payload = storage.get_value(0, &hw_counter);
-        assert!(stored_payload.is_some());
-        assert_eq!(stored_payload.unwrap(), payload);
+                let hw_counter = HardwareCounterCell::new();
+                let stored_payload = storage.get_value(0, &hw_counter);
+                assert!(stored_payload.is_some());
+                assert_eq!(stored_payload.unwrap(), payload);
+            };
 
-        // update payload
-        let mut updated_payload = Payload::default();
-        updated_payload.0.insert(
-            "key".to_string(),
-            serde_json::Value::String("updated".to_string()),
-        );
+        put_payload(&mut storage, "value", 0);
 
-        storage
-            .put_value(0, &updated_payload, hw_counter_ref)
-            .unwrap();
-        assert_eq!(storage.pages.len(), 1);
-        assert_eq!(storage.tracker.read().mapping_len(), 1);
+        put_payload(&mut storage, "updated", 1);
 
-        let stored_payload = storage.get_value(0, &hw_counter);
-        assert!(stored_payload.is_some());
-        assert_eq!(stored_payload.unwrap(), updated_payload);
+        put_payload(&mut storage, "updated again", 2);
+
+        storage.flush().unwrap();
+
+        // First block offset should be available again, so we can reuse it
+        put_payload(&mut storage, "updated after flush", 0);
     }
 
     #[test]
@@ -998,7 +1060,7 @@ mod tests {
                 .download()
                 .expect("download should succeed");
 
-            let csv_file = File::open(csv_path).expect("file should open");
+            let csv_file = BufReader::new(File::open(csv_path).expect("file should open"));
 
             let hw_counter = HardwareCounterCell::new();
             let hw_counter_ref = hw_counter.ref_payload_io_write_counter();
@@ -1031,7 +1093,7 @@ mod tests {
                 .download()
                 .expect("download should succeed");
 
-            let csv_file = File::open(csv_path).expect("file should open");
+            let csv_file = BufReader::new(File::open(csv_path).expect("file should open"));
             let hw_counter = HardwareCounterCell::new();
 
             let mut rdr = csv::Reader::from_reader(csv_file);

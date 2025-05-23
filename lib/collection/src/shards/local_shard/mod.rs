@@ -403,11 +403,10 @@ impl LocalShard {
             );
             let segments_path = LocalShard::segments_path(shard_path);
             let collection_params = collection_config.read().await.params.clone();
-            let payload_index_schema = payload_index_schema.read();
             segment_holder.create_appendable_segment(
                 &segments_path,
                 &collection_params,
-                &payload_index_schema,
+                payload_index_schema.clone(),
             )?;
         }
 
@@ -853,6 +852,7 @@ impl LocalShard {
         temp_path: &Path,
         tar: &tar_ext::BuilderExt,
         format: SnapshotFormat,
+        manifest: Option<SegmentManifests>,
         save_wal: bool,
     ) -> CollectionResult<()> {
         let segments = self.segments.clone();
@@ -880,10 +880,11 @@ impl LocalShard {
                 segments.clone(),
                 &segments_path,
                 Some(&collection_params),
-                &payload_index_schema.read().clone(),
+                payload_index_schema.clone(),
                 &temp_path,
                 &tar_c.descend(Path::new(SEGMENTS_PATH))?,
                 format,
+                manifest.as_ref(),
             )?;
 
             if save_wal {

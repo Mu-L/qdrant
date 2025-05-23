@@ -33,7 +33,7 @@ use super::qdrant::{
     StrictModeMultivector, StrictModeMultivectorConfig, StrictModeSparse, StrictModeSparseConfig,
     UuidIndexParams, VectorsOutput, WithLookup, raw_query, start_from,
 };
-use super::{Expression, Formula, RecoQuery};
+use super::{Expression, Formula, RecoQuery, Usage};
 use crate::conversions::json::{self, json_to_proto};
 use crate::grpc::qdrant::condition::ConditionOneOf;
 use crate::grpc::qdrant::r#match::MatchValue;
@@ -61,7 +61,7 @@ use crate::rest::schema as rest;
 pub fn convert_shard_key_to_grpc(value: segment::types::ShardKey) -> ShardKey {
     match value {
         segment::types::ShardKey::Keyword(keyword) => ShardKey {
-            key: Some(shard_key::Key::Keyword(keyword)),
+            key: Some(shard_key::Key::Keyword(keyword.to_string())),
         },
         segment::types::ShardKey::Number(number) => ShardKey {
             key: Some(shard_key::Key::Number(number)),
@@ -71,30 +71,19 @@ pub fn convert_shard_key_to_grpc(value: segment::types::ShardKey) -> ShardKey {
 
 pub fn convert_shard_key_from_grpc(value: ShardKey) -> Option<segment::types::ShardKey> {
     let ShardKey { key } = value;
-    match key {
-        None => None,
-        Some(key) => match key {
-            shard_key::Key::Keyword(keyword) => Some(segment::types::ShardKey::Keyword(keyword)),
-            shard_key::Key::Number(number) => Some(segment::types::ShardKey::Number(number)),
-        },
-    }
+    key.map(|key| match key {
+        shard_key::Key::Keyword(keyword) => segment::types::ShardKey::from(keyword),
+        shard_key::Key::Number(number) => segment::types::ShardKey::Number(number),
+    })
 }
 
 pub fn convert_shard_key_from_grpc_opt(
     value: Option<ShardKey>,
 ) -> Option<segment::types::ShardKey> {
-    match value {
-        None => None,
-        Some(key) => match key.key {
-            None => None,
-            Some(key) => match key {
-                shard_key::Key::Keyword(keyword) => {
-                    Some(segment::types::ShardKey::Keyword(keyword))
-                }
-                shard_key::Key::Number(number) => Some(segment::types::ShardKey::Number(number)),
-            },
-        },
-    }
+    value.and_then(|value| value.key).map(|key| match key {
+        shard_key::Key::Keyword(keyword) => segment::types::ShardKey::from(keyword),
+        shard_key::Key::Number(number) => segment::types::ShardKey::Number(number),
+    })
 }
 impl From<ShardKeySelector> for rest::ShardKeySelector {
     fn from(value: ShardKeySelector) -> Self {
@@ -2254,7 +2243,7 @@ impl From<PointsOperationResponseInternal> for PointsOperationResponse {
         Self {
             result: result.map(Into::into),
             time,
-            usage,
+            usage: Some(Usage { hardware: usage }),
         }
     }
 }
@@ -2270,7 +2259,7 @@ impl From<PointsOperationResponse> for PointsOperationResponseInternal {
         Self {
             result: result.map(Into::into),
             time,
-            usage,
+            usage: usage.unwrap_or_default().hardware,
         }
     }
 }

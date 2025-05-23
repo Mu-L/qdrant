@@ -8,6 +8,7 @@ pub mod graph_layers;
 pub mod graph_layers_builder;
 pub mod graph_links;
 pub mod hnsw;
+mod links_container;
 pub mod point_scorer;
 mod search_context;
 
@@ -20,6 +21,13 @@ pub mod gpu {
     pub mod gpu_devices_manager {
         /// Placeholder for GPU device to process indexing on.
         pub struct LockedGpuDevice<'a> {
+            phantom: std::marker::PhantomData<&'a usize>,
+        }
+    }
+
+    pub mod gpu_insert_context {
+        /// Placeholder for GPU insertion context to process indexing on.
+        pub struct GpuInsertContext<'a> {
             phantom: std::marker::PhantomData<&'a usize>,
         }
     }

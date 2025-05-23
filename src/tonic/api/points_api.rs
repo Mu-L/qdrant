@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use api::grpc::ops::usage_or_none;
 use api::grpc::qdrant::points_server::Points;
 use api::grpc::qdrant::{
     ClearPayloadPoints, CountPoints, CountResponse, CreateFieldIndexCollection,
@@ -644,6 +645,7 @@ impl Points for PointsService {
         &self,
         mut request: Request<QueryPointGroups>,
     ) -> Result<Response<QueryGroupsResponse>, Status> {
+        validate(request.get_ref())?;
         let access = extract_access(&mut request);
         let inference_token = extract_token(&request);
         let collection_name = request.get_ref().collection_name.clone();
@@ -700,7 +702,7 @@ impl Points for PointsService {
         let pairs_response = SearchMatrixPairsResponse {
             result: Some(SearchMatrixPairs::from(search_matrix_response)),
             time: timing.elapsed().as_secs_f64(),
-            usage: hw_metrics.to_grpc_api(),
+            usage: usage_or_none(hw_metrics.to_grpc_api()),
         };
 
         Ok(Response::new(pairs_response))
@@ -726,7 +728,7 @@ impl Points for PointsService {
         let offsets_response = SearchMatrixOffsetsResponse {
             result: Some(SearchMatrixOffsets::from(search_matrix_response)),
             time: timing.elapsed().as_secs_f64(),
-            usage: hw_metrics.to_grpc_api(),
+            usage: usage_or_none(hw_metrics.to_grpc_api()),
         };
 
         Ok(Response::new(offsets_response))

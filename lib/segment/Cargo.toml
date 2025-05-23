@@ -12,6 +12,7 @@ edition = "2024"
 workspace = true
 
 [features]
+default = ["rocksdb"]
 multiling-chinese = [
     "charabia/chinese-segmentation",
     "charabia/chinese-normalization",
@@ -21,6 +22,10 @@ multiling-japanese = ["charabia/japanese"]
 multiling-korean = ["charabia/korean"]
 testing = ["common/testing", "sparse/testing", "gpu/testing"]
 gpu = ["gpu/gpu"]
+
+# Disabling RocksDB feature only partially disables RocksDB usage
+# More work is still required to eventually completely disable and remove it
+rocksdb = []
 
 [build-dependencies]
 cc = "1.2"
@@ -85,13 +90,13 @@ fs_extra = "1.3.0"
 tinyvec = { version = "1.9.0", features = ["alloc", "latest_stable_rust"] }
 validator = { workspace = true }
 chrono = { workspace = true }
-smol_str = { version = "0.3.2", default-features = false, features = ["serde"] }
+ecow = { version = "0.2.5", features = ["serde"] }
 fnv = { workspace = true }
 indexmap = { workspace = true }
 ahash = { workspace = true }
 self_cell = "1.2.0"
 sha2 = { workspace = true }
-smallvec = "1.15.0"
+smallvec = { workspace = true }
 is_sorted = "0.1.1"
 strum = { workspace = true }
 byteorder = { workspace = true }
@@ -125,11 +130,12 @@ merge = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 cgroups-rs = "0.3"
 procfs = { version = "0.17", default-features = false }
-io-uring = "0.7.4"
+io-uring = "0.7.7"
 
 [[bench]]
 name = "vector_search"
 harness = false
+required-features = ["rocksdb"]
 
 [[bench]]
 name = "hnsw_build_graph"
@@ -178,10 +184,12 @@ harness = false
 [[bench]]
 name = "sparse_index_build"
 harness = false
+required-features = ["rocksdb"]
 
 [[bench]]
 name = "sparse_vector_storage"
 harness = false
+required-features = ["rocksdb"]
 
 [[bench]]
 name = "multi_vector_search"

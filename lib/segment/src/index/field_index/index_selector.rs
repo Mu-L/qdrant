@@ -51,7 +51,7 @@ impl IndexSelector<'_> {
         field: &JsonPath,
         payload_schema: &PayloadFieldSchema,
     ) -> OperationResult<Vec<FieldIndex>> {
-        let mut indexes = match payload_schema.expand().as_ref() {
+        let indexes = match payload_schema.expand().as_ref() {
             PayloadSchemaParams::Keyword(_) => vec![FieldIndex::KeywordIndex(self.map_new(field)?)],
             PayloadSchemaParams::Integer(integer_params) => itertools::chain(
                 integer_params
@@ -84,10 +84,6 @@ impl IndexSelector<'_> {
             }
         };
 
-        if let Some(null_index) = self.new_null_index(field)? {
-            indexes.push(null_index);
-        }
-
         Ok(indexes)
     }
 
@@ -97,7 +93,7 @@ impl IndexSelector<'_> {
         field: &JsonPath,
         payload_schema: &PayloadFieldSchema,
     ) -> OperationResult<Vec<FieldIndexBuilder>> {
-        let mut builders = match payload_schema.expand().as_ref() {
+        let builders = match payload_schema.expand().as_ref() {
             PayloadSchemaParams::Keyword(_) => {
                 vec![self.map_builder(
                     field,
@@ -158,17 +154,13 @@ impl IndexSelector<'_> {
             }
         };
 
-        if let Some(null_builder) = self.null_builder(field)? {
-            builders.push(null_builder);
-        }
-
         Ok(builders)
     }
 
     fn map_new<N: MapIndexKey + ?Sized>(&self, field: &JsonPath) -> OperationResult<MapIndex<N>> {
         Ok(match self {
             IndexSelector::RocksDb(IndexSelectorRocksDb { db, is_appendable }) => {
-                MapIndex::new_memory(Arc::clone(db), &field.to_string(), *is_appendable)
+                MapIndex::new_rocksdb(Arc::clone(db), &field.to_string(), *is_appendable)
             }
             IndexSelector::Mmap(IndexSelectorMmap { dir, is_on_disk }) => {
                 MapIndex::new_mmap(&map_dir(dir, field), *is_on_disk)?
@@ -183,11 +175,11 @@ impl IndexSelector<'_> {
         make_mmap: fn(MapIndexMmapBuilder<N>) -> FieldIndexBuilder,
     ) -> FieldIndexBuilder {
         match self {
-            IndexSelector::RocksDb(IndexSelectorRocksDb { db, .. }) => {
-                make_rocksdb(MapIndex::builder(Arc::clone(db), &field.to_string()))
-            }
+            IndexSelector::RocksDb(IndexSelectorRocksDb { db, .. }) => make_rocksdb(
+                MapIndex::builder_rocksdb(Arc::clone(db), &field.to_string()),
+            ),
             IndexSelector::Mmap(IndexSelectorMmap { dir, is_on_disk }) => {
-                make_mmap(MapIndex::mmap_builder(&map_dir(dir, field), *is_on_disk))
+                make_mmap(MapIndex::builder_mmap(&map_dir(dir, field), *is_on_disk))
             }
         }
     }
@@ -198,7 +190,7 @@ impl IndexSelector<'_> {
     ) -> OperationResult<NumericIndex<T, P>> {
         Ok(match self {
             IndexSelector::RocksDb(IndexSelectorRocksDb { db, is_appendable }) => {
-                NumericIndex::new(Arc::clone(db), &field.to_string(), *is_appendable)
+                NumericIndex::new_rocksdb(Arc::clone(db), &field.to_string(), *is_appendable)
             }
             IndexSelector::Mmap(IndexSelectorMmap { dir, is_on_disk }) => {
                 NumericIndex::new_mmap(&numeric_dir(dir, field), *is_on_disk)?
@@ -219,7 +211,10 @@ impl IndexSelector<'_> {
             IndexSelector::RocksDb(IndexSelectorRocksDb {
                 db,
                 is_appendable: _,
-            }) => make_rocksdb(NumericIndex::builder(Arc::clone(db), &field.to_string())),
+            }) => make_rocksdb(NumericIndex::builder_rocksdb(
+                Arc::clone(db),
+                &field.to_string(),
+            )),
             IndexSelector::Mmap(IndexSelectorMmap { dir, is_on_disk }) => make_mmap(
                 NumericIndex::builder_mmap(&numeric_dir(dir, field), *is_on_disk),
             ),
@@ -237,24 +232,23 @@ impl IndexSelector<'_> {
         })
     }
 
-    fn null_builder(&self, field: &JsonPath) -> OperationResult<Option<FieldIndexBuilder>> {
-        Ok(match self {
-            IndexSelector::RocksDb(IndexSelectorRocksDb { .. }) => None, // ToDo: appendable index should also be created
-            IndexSelector::Mmap(IndexSelectorMmap { dir, is_on_disk: _ }) => Some(
-                // null index is always on disk
-                FieldIndexBuilder::NullIndex(MmapNullIndex::builder(&null_dir(dir, field))?),
-            ),
-        })
+    pub fn null_builder(dir: &Path, field: &JsonPath) -> OperationResult<FieldIndexBuilder> {
+        // null index is always on disk and appendable
+        Ok(FieldIndexBuilder::NullIndex(MmapNullIndex::builder(
+            &null_dir(dir, field),
+        )?))
     }
 
-    fn new_null_index(&self, field: &JsonPath) -> OperationResult<Option<FieldIndex>> {
-        Ok(match self {
-            IndexSelector::RocksDb(IndexSelectorRocksDb { .. }) => None, // ToDo: appendable index should also be created
-            IndexSelector::Mmap(IndexSelectorMmap { dir, is_on_disk: _ }) => {
-                // null index is always on disk
-                MmapNullIndex::open_if_exists(&null_dir(dir, field))?.map(FieldIndex::NullIndex)
-            }
-        })
+    pub fn new_null_index(
+        dir: &Path,
+        field: &JsonPath,
+        total_point_count: usize,
+    ) -> OperationResult<Option<FieldIndex>> {
+        // null index is always on disk and is appendable
+        Ok(
+            MmapNullIndex::open_if_exists(&null_dir(dir, field), total_point_count)?
+                .map(FieldIndex::NullIndex),
+        )
     }
 
     fn geo_builder(
@@ -280,7 +274,7 @@ impl IndexSelector<'_> {
     ) -> OperationResult<FullTextIndex> {
         Ok(match self {
             IndexSelector::RocksDb(IndexSelectorRocksDb { db, is_appendable }) => {
-                FullTextIndex::new_memory(
+                FullTextIndex::new_rocksdb(
                     Arc::clone(db),
                     config,
                     &field.to_string(),
@@ -298,7 +292,7 @@ impl IndexSelector<'_> {
             IndexSelector::RocksDb(IndexSelectorRocksDb {
                 db,
                 is_appendable: _,
-            }) => FieldIndexBuilder::FullTextIndex(FullTextIndex::builder(
+            }) => FieldIndexBuilder::FullTextIndex(FullTextIndex::builder_rocksdb(
                 Arc::clone(db),
                 config,
                 &field.to_string(),

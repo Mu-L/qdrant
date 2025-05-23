@@ -30,13 +30,19 @@ pub enum PrimaryCondition {
     HasVector(VectorNameBuf),
 }
 
+impl From<FieldCondition> for PrimaryCondition {
+    fn from(condition: FieldCondition) -> Self {
+        PrimaryCondition::Condition(Box::new(condition))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PayloadBlockCondition {
     pub condition: FieldCondition,
     pub cardinality: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CardinalityEstimation {
     /// Conditions that could be used to make a primary point selection.
     pub primary_clauses: Vec<PrimaryCondition>,

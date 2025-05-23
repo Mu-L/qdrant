@@ -6,7 +6,7 @@ use semver::Version;
 use crate::cpu;
 
 /// Current Qdrant version string
-pub const QDRANT_VERSION_STRING: &str = "1.14.0";
+pub const QDRANT_VERSION_STRING: &str = "1.14.1";
 
 lazy_static! {
     /// Current Qdrant semver version
@@ -57,5 +57,28 @@ pub fn thread_count_for_hnsw(num_cpu: usize) -> usize {
         0..=48 => 8.min(num_cpu).max(1),
         49..=64 => 12,
         65.. => 16,
+    }
+}
+
+/// Number of search threads to use in the search runtime.
+///
+/// Dynamic based on CPU size.
+#[inline(always)]
+pub fn search_thread_count(max_search_threads: usize) -> usize {
+    if max_search_threads != 0 {
+        return max_search_threads;
+    }
+
+    // At least one thread, but not more than number of CPUs - 1 if there are more than 2 CPU
+    // Example:
+    // Num CPU = 1 -> 1 thread
+    // Num CPU = 2 -> 2 thread - if we use one thread with 2 cpus, its too much un-utilized resources
+    // Num CPU = 3 -> 2 thread
+    // Num CPU = 4 -> 3 thread
+    // Num CPU = 5 -> 4 thread
+    match cpu::get_num_cpus() {
+        0..=1 => 1,
+        2 => 2,
+        num_cpu @ 3.. => num_cpu - 1,
     }
 }

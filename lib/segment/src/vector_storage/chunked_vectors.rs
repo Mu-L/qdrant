@@ -1,7 +1,7 @@
 use std::cmp::max;
 use std::collections::TryReserveError;
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::mem;
 use std::path::Path;
 
@@ -205,22 +205,22 @@ impl quantization::EncodedStorage for ChunkedVectors<u8> {
         if vectors.len() == vectors_count {
             Ok(vectors)
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Loaded vectors count {} is not equal to expected count {vectors_count}",
-                    vectors.len(),
-                ),
-            ))
+            Err(std::io::Error::other(format!(
+                "Loaded vectors count {} is not equal to expected count {vectors_count}",
+                vectors.len(),
+            )))
         }
     }
 
     fn save_to_file(&self, path: &Path) -> std::io::Result<()> {
-        let mut buffer = File::create(path)?;
+        let mut buffer = BufWriter::new(File::create(path)?);
         for i in 0..self.len() {
             buffer.write_all(self.get(i))?;
         }
-        buffer.sync_all()?;
+
+        // Explicitly flush write buffer so we can catch IO errors
+        buffer.flush()?;
+        buffer.into_inner()?.sync_all()?;
         Ok(())
     }
 

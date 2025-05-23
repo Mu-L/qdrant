@@ -16,13 +16,15 @@ use common::small_uint::U24;
 use common::types::PointOffsetType;
 use io::storage_version::StorageVersion;
 use itertools::Itertools;
+use rand::Rng;
 use tempfile::TempDir;
 use uuid::Uuid;
 
+use super::rocksdb_builder::RocksDbBuilder;
 use super::{
     create_mutable_id_tracker, create_payload_storage, create_sparse_vector_index,
     create_sparse_vector_storage, get_payload_index_path, get_vector_index_path,
-    get_vector_storage_path, new_segment_path, open_segment_db, open_vector_storage,
+    get_vector_storage_path, new_segment_path, open_vector_storage,
 };
 use crate::common::error_logging::LogError;
 use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
@@ -38,6 +40,7 @@ use crate::index::{PayloadIndex, VectorIndexEnum};
 use crate::payload_storage::PayloadStorage;
 use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
 use crate::segment::{Segment, SegmentVersion};
+use crate::segment_constructor::batched_reader::{BatchedVectorReader, PointData};
 use crate::segment_constructor::{
     VectorIndexBuildArgs, VectorIndexOpenArgs, build_vector_index, load_segment,
 };
@@ -77,13 +80,7 @@ impl SegmentBuilder {
         temp_dir: &Path,
         segment_config: &SegmentConfig,
     ) -> OperationResult<Self> {
-        // When we build a new segment, it is empty at first,
-        // so we can ignore the `stopped` flag
-        let stopped = AtomicBool::new(false);
-
         let temp_dir = create_temp_dir(temp_dir)?;
-
-        let database = open_segment_db(temp_dir.path(), segment_config)?;
 
         let id_tracker = if segment_config.is_appendable() {
             IdTrackerEnum::MutableIdTracker(create_mutable_id_tracker(temp_dir.path())?)
@@ -91,18 +88,23 @@ impl SegmentBuilder {
             IdTrackerEnum::InMemoryIdTracker(InMemoryIdTracker::new())
         };
 
+        let mut db_builder = RocksDbBuilder::new(temp_dir.path(), segment_config)?;
+
         let payload_storage =
-            create_payload_storage(database.clone(), segment_config, temp_dir.path())?;
+            create_payload_storage(&mut db_builder, temp_dir.path(), segment_config)?;
 
         let mut vector_data = HashMap::new();
 
         for (vector_name, vector_config) in &segment_config.vector_data {
             let vector_storage_path = get_vector_storage_path(temp_dir.path(), vector_name);
             let vector_storage = open_vector_storage(
-                &database,
+                #[cfg(feature = "rocksdb")]
+                &mut db_builder,
                 vector_config,
-                &stopped,
+                #[cfg(feature = "rocksdb")]
+                &Default::default(),
                 &vector_storage_path,
+                #[cfg(feature = "rocksdb")]
                 vector_name,
             )?;
 
@@ -119,11 +121,14 @@ impl SegmentBuilder {
             let vector_storage_path = get_vector_storage_path(temp_dir.path(), vector_name);
 
             let vector_storage = create_sparse_vector_storage(
-                database.clone(),
+                #[cfg(feature = "rocksdb")]
+                &mut db_builder,
                 &vector_storage_path,
+                #[cfg(feature = "rocksdb")]
                 vector_name,
                 &sparse_vector_config.storage_type,
-                &stopped,
+                #[cfg(feature = "rocksdb")]
+                &Default::default(),
             )?;
 
             vector_data.insert(
@@ -157,6 +162,18 @@ impl SegmentBuilder {
 
     pub fn remove_indexed_field(&mut self, field: &PayloadKeyType) {
         self.indexed_fields.remove(field);
+    }
+
+    pub fn remove_index_field_if_incompatible(
+        &mut self,
+        field: &PayloadKeyType,
+        schema: &PayloadFieldSchema,
+    ) {
+        if let Some(existing_schema) = self.indexed_fields.get(field) {
+            if existing_schema != schema {
+                self.indexed_fields.remove(field);
+            }
+        }
     }
 
     pub fn add_indexed_field(&mut self, field: PayloadKeyType, schema: PayloadFieldSchema) {
@@ -262,16 +279,6 @@ impl SegmentBuilder {
             return Ok(true);
         }
 
-        struct PointData {
-            external_id: CompactExtendedPointId,
-            /// [`CompactExtendedPointId`] is 17 bytes, we reduce
-            /// `segment_index` to 3 bytes to avoid paddings and align nicely.
-            segment_index: U24,
-            internal_id: PointOffsetType,
-            version: u64,
-            ordering: u64,
-        }
-
         if segments.len() > U24::MAX as usize {
             return Err(OperationError::service_error("Too many segments to update"));
         }
@@ -338,15 +345,12 @@ impl SegmentBuilder {
                 })
                 .collect::<Result<Vec<_>, OperationError>>()?;
 
-            let mut iter = points_to_insert.iter().map(|point_data| {
-                let other_vector_storage =
-                    &other_vector_storages[point_data.segment_index.get() as usize];
-                let vec = other_vector_storage.get_vector(point_data.internal_id);
-                let vector_deleted = other_vector_storage.is_deleted_vector(point_data.internal_id);
-                (vec, vector_deleted)
-            });
+            let mut vectors_iter: BatchedVectorReader =
+                BatchedVectorReader::new(&points_to_insert, &other_vector_storages);
 
-            let internal_range = vector_data.vector_storage.update_from(&mut iter, stopped)?;
+            let internal_range = vector_data
+                .vector_storage
+                .update_from(&mut vectors_iter, stopped)?;
 
             match &new_internal_range {
                 Some(new_internal_range) => {
@@ -372,7 +376,7 @@ impl SegmentBuilder {
                 let old_internal_id = point_data.internal_id;
 
                 let other_payload = payloads[point_data.segment_index.get() as usize]
-                    .get_payload(old_internal_id, &hw_counter)?; // Internal operation, no measurement needed!
+                    .get_payload_sequential(old_internal_id, &hw_counter)?; // Internal operation, no measurement needed!
 
                 match self
                     .id_tracker
@@ -442,10 +446,11 @@ impl SegmentBuilder {
         Ok(true)
     }
 
-    pub fn build(
+    pub fn build<R: Rng + ?Sized>(
         self,
         permit: ResourcePermit,
         stopped: &AtomicBool,
+        rng: &mut R,
         hw_counter: &HardwareCounterCell,
     ) -> Result<Segment, OperationError> {
         let (temp_dir, destination_path) = {
@@ -478,6 +483,7 @@ impl SegmentBuilder {
                 IdTrackerEnum::ImmutableIdTracker(_) => {
                     unreachable!("ImmutableIdTracker should not be used for building segment")
                 }
+                #[cfg(feature = "rocksdb")]
                 IdTrackerEnum::RocksDbIdTracker(_) => id_tracker,
             };
 
@@ -577,6 +583,7 @@ impl SegmentBuilder {
                         old_indices: &old_indices.remove(vector_name).unwrap(),
                         gpu_device: gpu_device.as_ref(),
                         stopped,
+                        rng,
                         feature_flags: feature_flags(),
                     },
                 )?;
@@ -655,7 +662,7 @@ impl SegmentBuilder {
         };
 
         // Move fully constructed segment into collection directory and load back to RAM
-        std::fs::rename(temp_dir.into_path(), &destination_path)
+        std::fs::rename(temp_dir.keep(), &destination_path)
             .describe("Moving segment data after optimization")?;
 
         let loaded_segment = load_segment(&destination_path, stopped)?.ok_or_else(|| {

@@ -7,8 +7,8 @@ echo $PWD
 cd "$(dirname "$0")/../../"
 
 QDRANT_HOST='localhost:6333'
-PREV_PATCH_QDRANT_VERSION='v1.13.5'
-PREV_MINOR_QDRANT_VERSION='v1.12.6'
+PREV_PATCH_QDRANT_VERSION='v1.14.0'
+PREV_MINOR_QDRANT_VERSION='v1.13.5'
 
 RETRY_LIMIT=30
 
@@ -126,9 +126,3 @@ test_version $PREV_PATCH_QDRANT_VERSION
 
 # Test previous minor version
 test_version $PREV_MINOR_QDRANT_VERSION
-
-# Test gridstore storage generated manually with
-# export QDRANT__STORAGE__ON_DISK_PAYLOAD_USES_MMAP=true
-# export QDRANT__STORAGE__ON_DISK_SPARSE_VECTORS_USES_MMAP=true
-# in the gen_storage_compat_data.sh script
-test_version 'v1.12.6-blob-store'

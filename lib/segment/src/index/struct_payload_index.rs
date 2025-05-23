@@ -23,7 +23,6 @@ use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
 use crate::common::utils::IndexesMap;
 use crate::id_tracker::IdTrackerSS;
-use crate::index::PayloadIndex;
 use crate::index::field_index::{
     CardinalityEstimation, FieldIndex, PayloadBlockCondition, PrimaryCondition,
 };
@@ -32,14 +31,14 @@ use crate::index::query_estimator::estimate_filter;
 use crate::index::query_optimization::payload_provider::PayloadProvider;
 use crate::index::struct_filter_context::StructFilterContext;
 use crate::index::visited_pool::VisitedPool;
+use crate::index::{BuildIndexResult, PayloadIndex};
 use crate::json_path::JsonPath;
 use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
 use crate::payload_storage::{FilterContext, PayloadStorage};
 use crate::telemetry::PayloadIndexTelemetry;
 use crate::types::{
     Condition, FieldCondition, Filter, IsEmptyCondition, IsNullCondition, Payload,
-    PayloadContainer, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, PayloadSchemaType,
-    VectorNameBuf, infer_collection_value_type, infer_value_type,
+    PayloadContainer, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, VectorNameBuf,
 };
 use crate::vector_storage::{VectorStorage, VectorStorageEnum};
 
@@ -137,6 +136,17 @@ impl StructPayloadIndex {
             .selector(payload_schema)
             .new_index(field, payload_schema)?;
 
+        let total_point_count = self.id_tracker.borrow().total_point_count();
+
+        // Special null index complements every index.
+        if let Some(null_index) =
+            IndexSelector::new_null_index(&self.path, field, total_point_count)?
+        {
+            // todo: This means that null index will not be built if it is not loaded here.
+            //       Maybe we should set `is_loaded` to false to trigger index building.
+            indexes.push(null_index);
+        }
+
         let mut is_loaded = true;
         for ref mut index in indexes.iter_mut() {
             if !index.load()? {
@@ -146,6 +156,7 @@ impl StructPayloadIndex {
         }
         if !is_loaded {
             debug!("Index for `{field}` was not loaded. Building...");
+            debug_assert!(false, "Index should not need to be loaded during testing");
             // todo(ivan): decide what to do with indexes, which were not loaded
             indexes = self.build_field_indexes(
                 field,
@@ -224,6 +235,10 @@ impl StructPayloadIndex {
             .selector(payload_schema)
             .index_builder(field, payload_schema)?;
 
+        // Special null index complements every index.
+        let null_index = IndexSelector::null_builder(&self.path, field)?;
+        builders.push(null_index);
+
         for index in &mut builders {
             index.init()?;
         }
@@ -284,14 +299,14 @@ impl StructPayloadIndex {
             }
             Condition::IsEmpty(IsEmptyCondition { is_empty: field }) => {
                 let available_points = self.available_point_count();
-                let condition = FieldCondition::new_is_empty(field.key.clone());
+                let condition = FieldCondition::new_is_empty(field.key.clone(), true);
 
                 self.estimate_field_condition(&condition, nested_path, hw_counter)
                     .unwrap_or_else(|| CardinalityEstimation::unknown(available_points))
             }
             Condition::IsNull(IsNullCondition { is_null: field }) => {
                 let available_points = self.available_point_count();
-                let condition = FieldCondition::new_is_null(field.key.clone());
+                let condition = FieldCondition::new_is_null(field.key.clone(), true);
 
                 self.estimate_field_condition(&condition, nested_path, hw_counter)
                     .unwrap_or_else(|| CardinalityEstimation::unknown(available_points))
@@ -363,6 +378,7 @@ impl StructPayloadIndex {
         &self.config
     }
 
+    // Iterates over points which satisfy the filter. Might include already deleted points.
     pub fn iter_filtered_points<'a>(
         &'a self,
         filter: &'a Filter,
@@ -397,8 +413,9 @@ impl StructPayloadIndex {
                         ))
                     })
                 })
-                .filter(move |&id| !visited_list.check_and_update_visited(id))
-                .filter(move |&i| struct_filtered_context.check(i));
+                .filter(move |&id| {
+                    !visited_list.check_and_update_visited(id) && struct_filtered_context.check(id)
+                });
 
             Either::Right(iter)
         }
@@ -483,18 +500,18 @@ impl PayloadIndex for StructPayloadIndex {
         field: PayloadKeyTypeRef,
         payload_schema: &PayloadFieldSchema,
         hw_counter: &HardwareCounterCell,
-    ) -> OperationResult<Option<Vec<FieldIndex>>> {
+    ) -> OperationResult<BuildIndexResult> {
         if let Some(prev_schema) = self.config.indexed_fields.get(field) {
             // the field is already indexed with the same schema
             // no need to rebuild index and to save the config
-            if prev_schema == payload_schema {
-                return Ok(None);
-            }
+            return if prev_schema == payload_schema {
+                Ok(BuildIndexResult::AlreadyBuilt)
+            } else {
+                Ok(BuildIndexResult::IncompatibleSchema)
+            };
         }
-
         let indexes = self.build_field_indexes(field, payload_schema, hw_counter)?;
-
-        Ok(Some(indexes))
+        Ok(BuildIndexResult::Built(indexes))
     }
 
     fn apply_index(
@@ -512,6 +529,36 @@ impl PayloadIndex for StructPayloadIndex {
         Ok(())
     }
 
+    fn set_indexed(
+        &mut self,
+        field: PayloadKeyTypeRef,
+        payload_schema: impl Into<PayloadFieldSchema>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        let payload_schema = payload_schema.into();
+
+        self.drop_index_if_incompatible(field, &payload_schema)?;
+
+        let field_index = match self.build_index(field, &payload_schema, hw_counter)? {
+            BuildIndexResult::Built(field_index) => field_index,
+            BuildIndexResult::AlreadyBuilt => {
+                // Index already built, no need to do anything
+                return Ok(());
+            }
+            BuildIndexResult::IncompatibleSchema => {
+                // We should have fixed it by now explicitly
+                // If it is not fixed, it is a bug
+                return Err(OperationError::service_error(format!(
+                    "Incompatible schema for field `{field}`. Please drop the index first."
+                )));
+            }
+        };
+
+        self.apply_index(field.to_owned(), payload_schema, field_index)?;
+
+        Ok(())
+    }
+
     fn drop_index(&mut self, field: PayloadKeyTypeRef) -> OperationResult<()> {
         self.config.indexed_fields.remove(field);
         let removed_indexes = self.field_indexes.remove(field);
@@ -523,6 +570,21 @@ impl PayloadIndex for StructPayloadIndex {
         }
 
         self.save_config()?;
+        Ok(())
+    }
+
+    fn drop_index_if_incompatible(
+        &mut self,
+        field: PayloadKeyTypeRef,
+        new_payload_schema: &PayloadFieldSchema,
+    ) -> OperationResult<()> {
+        if let Some(current_schema) = self.config.indexed_fields.get(field) {
+            // the field is already indexed with the same schema
+            // no need to rebuild index and to save the config
+            if current_schema != new_payload_schema {
+                self.drop_index(field)?;
+            }
+        }
         Ok(())
     }
 
@@ -589,7 +651,7 @@ impl PayloadIndex for StructPayloadIndex {
         threshold: usize,
     ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_> {
         match self.field_indexes.get(field) {
-            None => Box::new(vec![].into_iter()),
+            None => Box::new(std::iter::empty()),
             Some(indexes) => {
                 let field_clone = field.to_owned();
                 Box::new(indexes.iter().flat_map(move |field_index| {
@@ -668,6 +730,14 @@ impl PayloadIndex for StructPayloadIndex {
         self.payload.borrow().get(point_id, hw_counter)
     }
 
+    fn get_payload_sequential(
+        &self,
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload> {
+        self.payload.borrow().get_sequential(point_id, hw_counter)
+    }
+
     fn delete_payload(
         &mut self,
         point_id: PointOffsetType,
@@ -711,6 +781,10 @@ impl PayloadIndex for StructPayloadIndex {
                         log::warn!(
                             "Flush: RocksDB cf_handle error: Cannot find column family {name}. Assume index is removed.",
                         );
+                        debug_assert!(
+                            false,
+                            "Missing column family should not happen during testing"
+                        );
                     }
                     Err(err) => {
                         return Err(OperationError::service_error(format!(
@@ -721,27 +795,6 @@ impl PayloadIndex for StructPayloadIndex {
             }
             Ok(())
         })
-    }
-
-    fn infer_payload_type(
-        &self,
-        key: PayloadKeyTypeRef,
-        hw_counter: &HardwareCounterCell,
-    ) -> OperationResult<Option<PayloadSchemaType>> {
-        let mut schema = None;
-        self.payload.borrow().iter(
-            |_id, payload: &Payload| {
-                let field_value = payload.get_value(key);
-                schema = match field_value.as_slice() {
-                    [] => None,
-                    [single] => infer_value_type(single),
-                    multiple => infer_collection_value_type(multiple.iter().copied()),
-                };
-                Ok(false)
-            },
-            hw_counter,
-        )?;
-        Ok(schema)
     }
 
     fn take_database_snapshot(&self, path: &Path) -> OperationResult<()> {

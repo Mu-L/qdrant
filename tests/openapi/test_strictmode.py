@@ -1,16 +1,22 @@
 import pytest
+from requests import Response
 
-from .conftest import collection_name
-from .helpers.collection_setup import basic_collection_setup, drop_collection
+from .conftest import collection_name as test_collection_name
+from .helpers.collection_setup import basic_collection_setup, drop_collection, full_collection_setup
 from .helpers.helpers import request_with_validation
 
+@pytest.fixture()
+def collection_name(test_collection_name):
+    basic_collection_setup(collection_name=test_collection_name)
+    yield test_collection_name
+    drop_collection(collection_name=test_collection_name)
 
-@pytest.fixture(autouse=True)
-def setup(collection_name):
-    basic_collection_setup(collection_name=collection_name)
-    yield
-    drop_collection(collection_name=collection_name)
-
+@pytest.fixture()
+def full_collection_name(test_collection_name):
+    coll_name = f"{test_collection_name}_full"
+    full_collection_setup(coll_name)
+    yield coll_name
+    drop_collection(collection_name=coll_name)
 
 def set_strict_mode(collection_name, strict_mode_config):
     request_with_validation(
@@ -156,7 +162,7 @@ def test_strict_mode_timeout_validation(collection_name):
     assert not search_fail.ok
 
 
-def test_strict_mode_unindexed_filter_read_validation(collection_name):
+def test_strict_mode_unindexed_filter_keyword_read_validation(collection_name):
     def search_request_with_filter():
         return request_with_validation(
             api='/collections/{collection_name}/points/search',
@@ -209,6 +215,91 @@ def test_strict_mode_unindexed_filter_read_validation(collection_name):
 
     # We created an index on this field so it should work now
     search_request_with_filter().raise_for_status()
+
+
+def test_strict_mode_unindexed_filter_integer_read_validation(collection_name):
+    def search_request_with_filter():
+        return request_with_validation(
+            api='/collections/{collection_name}/points/search',
+            method="POST",
+            path_params={'collection_name': collection_name},
+            body={
+                "vector": [0.2, 0.1, 0.9, 0.7],
+                "limit": 3,
+                "filter": {
+                    "must": [
+                        {
+                            "key": "count",
+                            "match": {
+                                "value": 1
+                            }
+                        }
+                    ]
+                },
+            }
+        )
+
+    # works without strict mode
+    search_request_with_filter().raise_for_status()
+
+    # enable strict mode `unindexed_filtering_retrieve`
+    set_strict_mode(collection_name, {
+        "enabled": True,
+        "unindexed_filtering_retrieve": True,
+    })
+
+    # still works
+    search_request_with_filter().raise_for_status()
+
+    # toggle `unindexed_filtering_retrieve`
+    set_strict_mode(collection_name, {
+        "unindexed_filtering_retrieve": False,
+    })
+
+    # search fail because no payload index
+    search_fail = search_request_with_filter()
+    assert "count" in search_fail.json()['status']['error']
+    assert not search_fail.ok
+
+    # create payload index
+    request_with_validation(
+        api='/collections/{collection_name}/index',
+        method="PUT",
+        path_params={'collection_name': collection_name},
+        query_params={'wait': 'true'},
+        body={
+            "field_name": "count",
+            "field_schema": {
+                "type": "integer",
+                "lookup": True,
+                "range": True,
+            }
+        }
+    ).raise_for_status()
+
+    # works now by leveraging index
+    search_request_with_filter().raise_for_status()
+
+    # remove lookup capacity on index
+    request_with_validation(
+        api='/collections/{collection_name}/index',
+        method="PUT",
+        path_params={'collection_name': collection_name},
+        query_params={'wait': 'true'},
+        body={
+            "field_name": "count",
+            "field_schema": {
+                "type": "integer",
+                "lookup": False,
+                "range": True,
+            }
+        }
+    ).raise_for_status()
+
+    # fails because the integer index does not support `lookup` for our match condition
+    search_fail = search_request_with_filter()
+    assert "count" in search_fail.json()['status']['error']
+    assert not search_fail.ok
 
 
 def test_strict_mode_unindexed_filter_write_validation(collection_name):
@@ -1362,6 +1453,26 @@ def test_strict_mode_formula_expression(collection_name):
     assert "discount_price" in query_fail.json()['status']['error']
     assert "formula expression" in query_fail.json()['status']['error']
 
+    # Create index on `discount_price`
+    request_with_validation(
+        api='/collections/{collection_name}/index',
+        method="PUT",
+        path_params={'collection_name': collection_name},
+        query_params={'wait': 'true'},
+        body={
+            "field_name": "discount_price",
+            "field_schema": {
+                "type": "integer",
+                "lookup": True,
+                "range": False,
+            }
+        }
+    ).raise_for_status()
+
+    # Query succeeds with the index
+    query_ok = query_request()
+    assert query_ok.ok
+
 
 def test_strict_mode_read_rate_limiting_small_replenish(collection_name):
     """
@@ -1682,7 +1793,7 @@ def test_strict_mode_group_limits(collection_name):
     )
 
     assert not response.ok
-    assert "Forbidden: Limit exceeded 30 > 15 for \"limit\"" in response.json()['status']['error']
+    assert "Limit exceeded 30 > 15 for \"limit\"" in response.json()['status']['error']
 
     response = request_with_validation(
         api="/collections/{collection_name}/points/query/groups",
@@ -1697,7 +1808,7 @@ def test_strict_mode_group_limits(collection_name):
         },
     )
     assert not response.ok
-    assert "Forbidden: Limit exceeded 30 > 15 for \"limit\"" in response.json()['status']['error']
+    assert "Limit exceeded 30 > 15 for \"limit\"" in response.json()['status']['error']
 
 def test_strict_mode_distance_matrix_limits(collection_name):
     response = request_with_validation(
@@ -1727,4 +1838,512 @@ def test_strict_mode_distance_matrix_limits(collection_name):
         },
     )
     assert not response.ok
-    assert "Forbidden: Limit exceeded 20 > 15 for \"limit\"" in response.json()['status']['error']
+    assert "Limit exceeded 20 > 15 for \"limit\"" in response.json()['status']['error']
+
+
+def test_read_rate_limiter_many_vectors(full_collection_name):
+    collection_name = full_collection_name
+
+    def check_response(response: Response, should_succeed: bool):
+        if should_succeed:
+            assert response.ok, response.text
+        else:
+            assert response.status_code == 429
+            assert "request larger than rate limiter capacity" in response.json()['status']['error']
+
+    def check_multivector_query_raw(should_succeed: bool):
+        # query api with vector
+        multivector = [[0.1, 0.2, 0.3, 0.4] for _ in range(3)]
+        search_response = request_with_validation(
+            api='/collections/{collection_name}/points/query',
+            method="POST",
+            path_params={'collection_name': collection_name},
+            body={
+                "query": multivector,
+                "using": "dense-multi",
+                "limit": 5
+            }
+        )
+        check_response(search_response, should_succeed)
+
+    def check_multivector_query_id(should_succeed: bool):
+        # query api with id
+        search_response = request_with_validation(
+            api='/collections/{collection_name}/points/query',
+            method="POST",
+            path_params={'collection_name': collection_name},
+            body={
+                "query": 2, # this point has a multivector of 3 vectors
+                "using": "dense-multi",
+                "limit": 5
+            }
+        )
+        check_response(search_response, should_succeed)
+
+    # check without strict mode
+    check_multivector_query_raw(should_succeed=True)
+    check_multivector_query_id(should_succeed=True)
+
+    # Set strict mode with very low read_rate_limit, it should not succeed
+    set_strict_mode(collection_name, {
+        "enabled": True,
+        "read_rate_limit": 2 # multivector has 3 vectors
+    })
+    check_multivector_query_raw(should_succeed=False)
+
+    # reset rate limiter for next request
+    set_strict_mode(collection_name, {
+        "enabled": True,
+        "read_rate_limit": 2 # multivector has 3 vectors
+    })
+    check_multivector_query_id(should_succeed=False)
+
+    # Set strict mode with just enough read_rate_limit, it should succeed
+    set_strict_mode(collection_name, {
+        "enabled": True,
+        "read_rate_limit": 3 # multivector has 3 vectors
+    })
+    check_multivector_query_raw(should_succeed=True)
+
+    # reset rate limiter for next request
+    set_strict_mode(collection_name, {
+        "enabled": True,
+        "read_rate_limit": 5 # multivector has 3 vectors
+                             # + 1 of fetching the id
+                             # + 1 of the filter for not including the id
+    })
+    check_multivector_query_id(should_succeed=True)
+
+
+def test_strict_mode_group_by_unindexed(collection_name):
+    response = request_with_validation(
+        api="/collections/{collection_name}/points/search/groups",
+        method="POST",
+        path_params={"collection_name": collection_name},
+        body={
+            "vector": [1.0, 0.0, 0.0, 0.0],
+            "limit": 10,
+            "with_payload": True,
+            "group_by": "docId",
+            "group_size": 3,
+        },
+    )
+    assert response.ok
+
+    response = request_with_validation(
+        api="/collections/{collection_name}/points/query/groups",
+        method="POST",
+        path_params={"collection_name": collection_name},
+        body={
+            "query": [1.0, 0.0, 0.0, 0.0],
+            "limit": 10,
+            "with_payload": True,
+            "group_by": "docId",
+            "group_size": 3,
+        },
+    )
+    assert response.ok
+
+    set_strict_mode(collection_name, {
+        "enabled": True,
+        "unindexed_filtering_retrieve": False,
+    })
+
+    # try again
+    response = request_with_validation(
+        api="/collections/{collection_name}/points/search/groups",
+        method="POST",
+        path_params={"collection_name": collection_name},
+        body={
+            "vector": [1.0, 0.0, 0.0, 0.0],
+            "limit": 10,
+            "with_payload": True,
+            "group_by": "docId",
+            "group_size": 3,
+        },
+    )
+
+    assert not response.ok
+    assert "Index required but not found for \"docId\". Help: Create an index supporting `match` for this key." in response.json()['status']['error']
+
+    response = request_with_validation(
+        api="/collections/{collection_name}/points/query/groups",
+        method="POST",
+        path_params={"collection_name": collection_name},
+        body={
+            "query": [1.0, 0.0, 0.0, 0.0],
+            "limit": 10,
+            "with_payload": True,
+            "group_by": "docId",
+            "group_size": 3,
+        },
+    )
+    assert not response.ok
+    assert "Index required but not found for \"docId\". Help: Create an index supporting `match` for this key." in response.json()['status']['error']
+
+    # create geo index
+    request_with_validation(
+        api='/collections/{collection_name}/index',
+        method="PUT",
+        path_params={'collection_name': collection_name},
+        query_params={'wait': 'true'},
+        body={
+            "field_name": "docId",
+            "field_schema": "geo"
+        }
+    ).raise_for_status()
+
+    # try again with geo index
+    response = request_with_validation(
+        api="/collections/{collection_name}/points/search/groups",
+        method="POST",
+        path_params={"collection_name": collection_name},
+        body={
+            "vector": [1.0, 0.0, 0.0, 0.0],
+            "limit": 10,
+            "with_payload": True,
+            "group_by": "docId",
+            "group_size": 3,
+        },
+    )
+
+    assert not response.ok
+    assert "Index of type \"Geo\" found for \"docId\". Help: Create an index supporting `match` for this key." in response.json()['status']['error']
+
+    response = request_with_validation(
+        api="/collections/{collection_name}/points/query/groups",
+        method="POST",
+        path_params={"collection_name": collection_name},
+        body={
+            "query": [1.0, 0.0, 0.0, 0.0],
+            "limit": 10,
+            "with_payload": True,
+            "group_by": "docId",
+            "group_size": 3,
+        },
+    )
+    assert not response.ok
+    assert "Index of type \"Geo\" found for \"docId\". Help: Create an index supporting `match` for this key." in response.json()['status']['error']
+
+    # create keyword index (supporting match)
+    request_with_validation(
+        api='/collections/{collection_name}/index',
+        method="PUT",
+        path_params={'collection_name': collection_name},
+        query_params={'wait': 'true'},
+        body={
+            "field_name": "docId",
+            "field_schema": "keyword"
+        }
+    ).raise_for_status()
+
+    # now it is allowed
+    response = request_with_validation(
+        api="/collections/{collection_name}/points/search/groups",
+        method="POST",
+        path_params={"collection_name": collection_name},
+        body={
+            "vector": [1.0, 0.0, 0.0, 0.0],
+            "limit": 10,
+            "with_payload": True,
+            "group_by": "docId",
+            "group_size": 3,
+        },
+    )
+    assert response.ok
+
+    response = request_with_validation(
+        api="/collections/{collection_name}/points/query/groups",
+        method="POST",
+        path_params={"collection_name": collection_name},
+        body={
+            "query": [1.0, 0.0, 0.0, 0.0],
+            "limit": 10,
+            "with_payload": True,
+            "group_by": "docId",
+            "group_size": 3,
+        },
+    )
+    assert response.ok
+
+
+def test_strict_mode_full_scan(full_collection_name):
+    collection_name = full_collection_name
+
+    # disable HNSW index
+    response = request_with_validation(
+        api='/collections/{collection_name}',
+        method="PATCH",
+        path_params={'collection_name': collection_name},
+        body={
+            "vectors": {
+                "dense-multi": {
+                    "hnsw_config": {
+                        "m": 0,
+                    },
+                },
+            }
+        }
+    )
+    assert response.ok
+
+    # full scan allowed
+    response = request_with_validation(
+        api='/collections/{collection_name}/points/query',
+        method="POST",
+        path_params={'collection_name': collection_name},
+        body={
+            "query": 2,
+            "using": "dense-multi",
+            "limit": 5
+        }
+    )
+    assert response.ok
+
+    # enable strict mode with search_allow_exact
+    set_strict_mode(collection_name, {
+        "enabled": True,
+        "search_allow_exact": False
+    })
+
+    # full scan not allowed
+    response = request_with_validation(
+        api='/collections/{collection_name}/points/query',
+        method="POST",
+        path_params={'collection_name': collection_name},
+        body={
+            "query": 2,
+            "using": "dense-multi",
+            "limit": 5
+        }
+    )
+    assert not response.ok
+    assert "Request is forbidden on 'dense-multi' because global vector indexing is disabled (hnsw_config.m = 0). Help: Use tenant-specific filter, enable global vector indexing or enable strict mode `search_allow_exact` option" in response.json()['status']['error']
+
+    # sparse vector still works
+    response = request_with_validation(
+        api='/collections/{collection_name}/points/query',
+        method="POST",
+        path_params={'collection_name': collection_name},
+        body={
+            "query": 2,
+            "using": "sparse-text",
+            "limit": 5
+        }
+    )
+    assert response.ok
+
+    # Disabled HNSW is Ok for rescoring
+    response = request_with_validation(
+        api='/collections/{collection_name}/points/query',
+        method="POST",
+        path_params={'collection_name': collection_name},
+        body={
+            "prefetch": [
+                {
+                    "query": 2,
+                    "using": "sparse-text",
+                    "limit": 50
+                }
+            ],
+            "query": 2,
+            "using": "dense-multi",
+            "limit": 5
+        }
+    )
+    assert response.ok
+
+    # Disabled HNSW forbidden prefetch
+    response = request_with_validation(
+        api='/collections/{collection_name}/points/query',
+        method="POST",
+        path_params={'collection_name': collection_name},
+        body={
+            "prefetch": [
+                {
+                    "query": 2,
+                    "using": "dense-multi",
+                    "limit": 50
+                }
+            ],
+            "query": 2,
+            "using": "sparse-text",
+            "limit": 5
+        }
+    )
+    assert not response.ok
+    assert "Request is forbidden on 'dense-multi' because global vector indexing is disabled (hnsw_config.m = 0). Help: Use tenant-specific filter, enable global vector indexing or enable strict mode `search_allow_exact` option" in response.json()['status']['error']
+
+
+def test_strict_mode_full_scan_simple(full_collection_name):
+    collection_name = full_collection_name
+
+    # Enable strict mode with search_allow_exact
+    response = request_with_validation(
+        api='/collections/{collection_name}',
+        method="PATCH",
+        path_params={'collection_name': collection_name},
+        body={
+            "strict_mode_config": {
+                "enabled": True,
+                "search_allow_exact": False
+            },
+        }
+    )
+    assert response.ok
+
+    # full scan allowed
+    response = request_with_validation(
+        api='/collections/{collection_name}/points/query',
+        method="POST",
+        path_params={'collection_name': collection_name},
+        body={
+            "query": 2,
+            "using": "dense-text",
+            "limit": 5
+        }
+    )
+    assert response.ok
+
+    # disable HNSW index
+    response = request_with_validation(
+        api='/collections/{collection_name}',
+        method="PATCH",
+        path_params={'collection_name': collection_name},
+        body={
+            "hnsw_config": {
+                "m": 0
+            }
+        }
+    )
+    assert response.ok
+
+    # full scan not allowed
+    response = request_with_validation(
+        api='/collections/{collection_name}/points/query',
+        method="POST",
+        path_params={'collection_name': collection_name},
+        body={
+            "query": 2,
+            "using": "dense-text",
+            "limit": 5
+        }
+    )
+    assert not response.ok
+    assert response.status_code == 400
+
+
+def test_strict_mode_multitenant_full_scan(full_collection_name):
+    collection_name = full_collection_name
+
+    def filtered_query():
+        return request_with_validation(
+            api='/collections/{collection_name}/points/query',
+            method="POST",
+            path_params={'collection_name': collection_name},
+            body={
+                "query": 2,
+                "filter": {
+                    "must": [
+                        {
+                            "key": "city",
+                            "match": {
+                                "value": "Berlin"
+                            }
+                        }
+                    ]
+                },
+                "using": "dense-multi",
+                "limit": 5
+            }
+        )
+
+    # disable HNSW index
+    response = request_with_validation(
+        api='/collections/{collection_name}',
+        method="PATCH",
+        path_params={'collection_name': collection_name},
+        body={
+            "vectors": {
+                "dense-multi": {
+                    "hnsw_config": {
+                        "m": 0,
+                        "payload_m": 0
+                    },
+                },
+            }
+        }
+    )
+    assert response.ok
+
+    # filtered search allowed
+    filtered_query().raise_for_status()
+
+    # enable strict mode with search_allow_exact
+    set_strict_mode(collection_name, {
+        "enabled": True,
+        "search_allow_exact": False
+    })
+
+    # filtered search not allowed anymore because no HNSW index
+    response = filtered_query()
+    assert not response.ok
+    assert "Request is forbidden on 'dense-multi'" in response.json()['status']['error']
+
+    # add payload index
+    request_with_validation(
+        api='/collections/{collection_name}/index',
+        method="PUT",
+        path_params={'collection_name': collection_name},
+        query_params={'wait': 'true'},
+        body={
+            "field_name": "city",
+            "field_schema": "keyword"
+        }
+    ).raise_for_status()
+
+    # still not allowed although we have payload index for the filter
+    response = filtered_query()
+    assert not response.ok
+    assert "Request is forbidden on 'dense-multi'" in response.json()['status']['error']
+
+    # add multitenant payload index
+    request_with_validation(
+        api='/collections/{collection_name}/index',
+        method="PUT",
+        path_params={'collection_name': collection_name},
+        query_params={'wait': 'true'},
+        body={
+            "field_name": "city",
+            "field_schema": {
+                "type": "keyword",
+                "is_tenant": True,
+            }
+        }
+    ).raise_for_status()
+
+    # still not allowed although we have a multitenant payload index for the filter
+    response = filtered_query()
+    assert not response.ok
+    assert "Request is forbidden on 'dense-multi'" in response.json()['status']['error']
+
+    # enabled HNSW payload based index
+    response = request_with_validation(
+        api='/collections/{collection_name}',
+        method="PATCH",
+        path_params={'collection_name': collection_name},
+        body={
+            "vectors": {
+                "dense-multi": {
+                    "hnsw_config": {
+                        "m": 0,
+                        "payload_m": 1
+                    },
+                },
+            }
+        }
+    )
+    assert response.ok
+
+    # finally allowed
+    filtered_query().raise_for_status()

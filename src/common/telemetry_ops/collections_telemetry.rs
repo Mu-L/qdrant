@@ -9,7 +9,7 @@ use storage::rbac::Access;
 #[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
 #[serde(untagged)]
 pub enum CollectionTelemetryEnum {
-    Full(CollectionTelemetry),
+    Full(Box<CollectionTelemetry>),
     Aggregated(CollectionsAggregatedTelemetry),
 }
 
@@ -17,6 +17,9 @@ pub enum CollectionTelemetryEnum {
 pub struct CollectionsTelemetry {
     #[anonymize(false)]
     pub number_of_collections: usize,
+    #[anonymize(false)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_collections: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collections: Option<Vec<CollectionTelemetryEnum>>,
 }
@@ -29,7 +32,7 @@ impl CollectionsTelemetry {
                 toc.get_telemetry_data(detail, access)
                     .await
                     .into_iter()
-                    .map(CollectionTelemetryEnum::Full)
+                    .map(|t| CollectionTelemetryEnum::Full(Box::new(t)))
                     .collect()
             } else {
                 toc.get_aggregated_telemetry_data(access)
@@ -44,8 +47,11 @@ impl CollectionsTelemetry {
             None
         };
 
+        let max_collections = toc.max_collections();
+
         CollectionsTelemetry {
             number_of_collections,
+            max_collections,
             collections,
         }
     }

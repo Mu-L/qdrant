@@ -1,4 +1,5 @@
 use std::cmp::{max, min};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use mutable_geo_index::InMemoryGeoMapIndex;
 use parking_lot::RwLock;
 use rocksdb::DB;
 use serde_json::Value;
-use smol_str::{SmolStr, format_smolstr};
+use smallvec::SmallVec;
 
 use self::immutable_geo_index::ImmutableGeoMapIndex;
 use self::mmap_geo_index::MmapGeoMapIndex;
@@ -49,14 +50,19 @@ impl GeoMapIndex {
         if is_appendable {
             GeoMapIndex::Mutable(MutableGeoMapIndex::new(db, &store_cf_name))
         } else {
-            GeoMapIndex::Immutable(ImmutableGeoMapIndex::new(db, &store_cf_name))
+            GeoMapIndex::Immutable(ImmutableGeoMapIndex::open_rocksdb(db, &store_cf_name))
         }
     }
 
     pub fn new_mmap(path: &Path, is_on_disk: bool) -> OperationResult<Self> {
-        Ok(GeoMapIndex::Mmap(Box::new(MmapGeoMapIndex::load(
-            path, is_on_disk,
-        )?)))
+        let mmap_index = MmapGeoMapIndex::load(path, is_on_disk)?;
+        if is_on_disk {
+            Ok(GeoMapIndex::Mmap(Box::new(mmap_index)))
+        } else {
+            Ok(GeoMapIndex::Immutable(ImmutableGeoMapIndex::open_mmap(
+                mmap_index,
+            )))
+        }
     }
 
     pub fn builder(db: Arc<RwLock<DB>>, field: &str) -> GeoMapIndexBuilder {
@@ -129,27 +135,36 @@ impl GeoMapIndex {
         format!("{field}_geo")
     }
 
-    fn encode_db_key(value: GeoHash, idx: PointOffsetType) -> SmolStr {
-        let value_str = SmolStr::from(value);
-        format_smolstr!("{value_str}/{idx}")
+    /// Encode db key
+    ///
+    /// Maximum length is 23 bytes, e.g.: `dr5ruj4477kd/4294967295`
+    fn encode_db_key(value: GeoHash, idx: PointOffsetType) -> SmallVec<[u8; 23]> {
+        let mut result = SmallVec::new();
+        write!(result, "{value}/{idx}").unwrap();
+        result
     }
 
-    fn decode_db_key(s: &str) -> OperationResult<(GeoHash, PointOffsetType)> {
+    fn decode_db_key<K>(s: K) -> OperationResult<(GeoHash, PointOffsetType)>
+    where
+        K: AsRef<[u8]>,
+    {
         const DECODE_ERR: &str = "Index db parsing error: wrong data format";
+        let s = s.as_ref();
         let separator_pos = s
-            .rfind('/')
+            .iter()
+            .rposition(|b| b == &b'/')
             .ok_or_else(|| OperationError::service_error(DECODE_ERR))?;
         if separator_pos == s.len() - 1 {
             return Err(OperationError::service_error(DECODE_ERR));
         }
-        let geohash_str = &s[..separator_pos];
-        let idx_str = &s[separator_pos + 1..];
-        let idx = PointOffsetType::from_str(idx_str)
-            .map_err(|_| OperationError::service_error(DECODE_ERR))?;
-        Ok((
-            GeoHash::new(geohash_str).map_err(OperationError::from)?,
-            idx,
-        ))
+        let geohash = &s[..separator_pos];
+        let idx_bytes = &s[separator_pos + 1..];
+        // Use `from_ascii_radix` here once stabilized instead of intermediate string reference
+        let idx = PointOffsetType::from_str(std::str::from_utf8(idx_bytes).map_err(|_| {
+            OperationError::service_error("Index load error: UTF8 error while DB parsing")
+        })?)
+        .map_err(|_| OperationError::service_error(DECODE_ERR))?;
+        Ok((GeoHash::new(geohash).map_err(OperationError::from)?, idx))
     }
 
     fn decode_db_value<T: AsRef<[u8]>>(value: T) -> OperationResult<GeoPoint> {
@@ -177,7 +192,7 @@ impl GeoMapIndex {
     pub fn flusher(&self) -> Flusher {
         match self {
             GeoMapIndex::Mutable(index) => index.db_wrapper().flusher(),
-            GeoMapIndex::Immutable(index) => index.db_wrapper().flusher(),
+            GeoMapIndex::Immutable(index) => index.flusher(),
             GeoMapIndex::Mmap(index) => index.flusher(),
         }
     }
@@ -549,7 +564,7 @@ impl PayloadFieldIndex for GeoMapIndex {
     fn cleanup(self) -> OperationResult<()> {
         match self {
             GeoMapIndex::Mutable(index) => index.db_wrapper().remove_column_family(),
-            GeoMapIndex::Immutable(index) => index.db_wrapper().remove_column_family(),
+            GeoMapIndex::Immutable(index) => index.clear(),
             GeoMapIndex::Mmap(index) => index.clear(),
         }
     }
@@ -560,7 +575,7 @@ impl PayloadFieldIndex for GeoMapIndex {
 
     fn files(&self) -> Vec<PathBuf> {
         match &self {
-            GeoMapIndex::Mutable(index) => index.files(),
+            GeoMapIndex::Mutable(_) => vec![],
             GeoMapIndex::Immutable(index) => index.files(),
             GeoMapIndex::Mmap(index) => index.files(),
         }
@@ -676,6 +691,7 @@ impl PayloadFieldIndex for GeoMapIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeSet, HashSet};
     use std::ops::Range;
 
     use common::counter::hardware_accumulator::HwMeasurementAcc;
@@ -691,19 +707,21 @@ mod tests {
     use crate::fixtures::payload_fixtures::random_geo_payload;
     use crate::json_path::JsonPath;
     use crate::types::test_utils::build_polygon;
-    use crate::types::{GeoBoundingBox, GeoLineString, GeoPolygon, GeoRadius};
+    use crate::types::{GeoBoundingBox, GeoLineString, GeoPolygon, GeoRadius, OrderedGeoPoint};
 
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum IndexType {
         Mutable,
         Immutable,
         Mmap,
+        RamMmap,
     }
 
     enum IndexBuilder {
         Mutable(GeoMapIndexBuilder),
         Immutable(GeoMapImmutableIndexBuilder),
         Mmap(GeoMapIndexMmapBuilder),
+        RamMmap(GeoMapIndexMmapBuilder),
     }
 
     impl IndexBuilder {
@@ -717,6 +735,7 @@ mod tests {
                 IndexBuilder::Mutable(builder) => builder.add_point(id, payload, hw_counter),
                 IndexBuilder::Immutable(builder) => builder.add_point(id, payload, hw_counter),
                 IndexBuilder::Mmap(builder) => builder.add_point(id, payload, hw_counter),
+                IndexBuilder::RamMmap(builder) => builder.add_point(id, payload, hw_counter),
             }
         }
 
@@ -725,6 +744,16 @@ mod tests {
                 IndexBuilder::Mutable(builder) => builder.finalize(),
                 IndexBuilder::Immutable(builder) => builder.finalize(),
                 IndexBuilder::Mmap(builder) => builder.finalize(),
+                IndexBuilder::RamMmap(builder) => {
+                    let GeoMapIndex::Mmap(index) = builder.finalize()? else {
+                        panic!("expected mmap index");
+                    };
+
+                    // Load index from mmap
+                    let mut index = GeoMapIndex::Immutable(ImmutableGeoMapIndex::open_mmap(*index));
+                    index.load()?;
+                    Ok(index)
+                }
             }
         }
     }
@@ -779,14 +808,16 @@ mod tests {
             IndexType::Immutable => {
                 IndexBuilder::Immutable(GeoMapIndex::builder_immutable(db.clone(), FIELD_NAME))
             }
-            IndexType::Mmap => {
-                IndexBuilder::Mmap(GeoMapIndex::mmap_builder(temp_dir.path(), false))
+            IndexType::Mmap => IndexBuilder::Mmap(GeoMapIndex::mmap_builder(temp_dir.path(), true)),
+            IndexType::RamMmap => {
+                IndexBuilder::RamMmap(GeoMapIndex::mmap_builder(temp_dir.path(), false))
             }
         };
         match &mut builder {
             IndexBuilder::Mutable(builder) => builder.init().unwrap(),
             IndexBuilder::Immutable(builder) => builder.init().unwrap(),
             IndexBuilder::Mmap(builder) => builder.init().unwrap(),
+            IndexBuilder::RamMmap(builder) => builder.init().unwrap(),
         }
         (builder, temp_dir, db)
     }
@@ -862,6 +893,7 @@ mod tests {
     #[case(IndexType::Mutable)]
     #[case(IndexType::Immutable)]
     #[case(IndexType::Mmap)]
+    #[case(IndexType::RamMmap)]
     fn test_polygon_with_exclusion(#[case] index_type: IndexType) {
         fn check_cardinality_match(
             hashes: Vec<GeoHash>,
@@ -1003,6 +1035,7 @@ mod tests {
     #[case(IndexType::Mutable)]
     #[case(IndexType::Immutable)]
     #[case(IndexType::Mmap)]
+    #[case(IndexType::RamMmap)]
     fn match_cardinality(#[case] index_type: IndexType) {
         fn check_cardinality_match(
             hashes: Vec<GeoHash>,
@@ -1055,6 +1088,7 @@ mod tests {
     #[case(IndexType::Mutable)]
     #[case(IndexType::Immutable)]
     #[case(IndexType::Mmap)]
+    #[case(IndexType::RamMmap)]
     fn geo_indexed_filtering(#[case] index_type: IndexType) {
         fn check_geo_indexed_filtering<F>(
             field_condition: FieldCondition,
@@ -1120,6 +1154,7 @@ mod tests {
     #[case(IndexType::Mutable)]
     #[case(IndexType::Immutable)]
     #[case(IndexType::Mmap)]
+    #[case(IndexType::RamMmap)]
     fn test_payload_blocks(#[case] index_type: IndexType) {
         let (field_index, _, _) = build_random_index(1000, 5, index_type);
         let hw_counter = HardwareCounterCell::new();
@@ -1151,6 +1186,7 @@ mod tests {
     #[case(IndexType::Mutable)]
     #[case(IndexType::Immutable)]
     #[case(IndexType::Mmap)]
+    #[case(IndexType::RamMmap)]
     fn match_cardinality_point_with_multi_far_geo_payload(#[case] index_type: IndexType) {
         let (mut builder, _, _) = create_builder(index_type);
 
@@ -1237,6 +1273,7 @@ mod tests {
     #[case(IndexType::Mutable)]
     #[case(IndexType::Immutable)]
     #[case(IndexType::Mmap)]
+    #[case(IndexType::RamMmap)]
     fn match_cardinality_point_with_multi_close_geo_payload(#[case] index_type: IndexType) {
         let (mut builder, _, _) = create_builder(index_type);
         let geo_values = json!([
@@ -1282,6 +1319,7 @@ mod tests {
     #[case(IndexType::Mutable)]
     #[case(IndexType::Immutable)]
     #[case(IndexType::Mmap)]
+    #[case(IndexType::RamMmap)]
     fn load_from_disk(#[case] index_type: IndexType) {
         let temp_dir = {
             let (mut builder, temp_dir, _) = create_builder(index_type);
@@ -1307,6 +1345,9 @@ mod tests {
             IndexType::Mutable => GeoMapIndex::new_memory(db, FIELD_NAME, true),
             IndexType::Immutable => GeoMapIndex::new_memory(db, FIELD_NAME, false),
             IndexType::Mmap => GeoMapIndex::new_mmap(temp_dir.path(), false).unwrap(),
+            IndexType::RamMmap => GeoMapIndex::Immutable(ImmutableGeoMapIndex::open_mmap(
+                MmapGeoMapIndex::load(temp_dir.path(), false).unwrap(),
+            )),
         };
         new_index.load().unwrap();
 
@@ -1341,6 +1382,7 @@ mod tests {
     #[case(IndexType::Mutable)]
     #[case(IndexType::Immutable)]
     #[case(IndexType::Mmap)]
+    #[case(IndexType::RamMmap)]
     fn same_geo_index_between_points_test(#[case] index_type: IndexType) {
         let temp_dir = {
             let (mut builder, temp_dir, _) = create_builder(index_type);
@@ -1377,6 +1419,9 @@ mod tests {
             IndexType::Mutable => GeoMapIndex::new_memory(db, FIELD_NAME, true),
             IndexType::Immutable => GeoMapIndex::new_memory(db, FIELD_NAME, false),
             IndexType::Mmap => GeoMapIndex::new_mmap(temp_dir.path(), false).unwrap(),
+            IndexType::RamMmap => GeoMapIndex::Immutable(ImmutableGeoMapIndex::open_mmap(
+                MmapGeoMapIndex::load(temp_dir.path(), false).unwrap(),
+            )),
         };
         new_index.load().unwrap();
         assert_eq!(new_index.points_count(), 1);
@@ -1389,6 +1434,7 @@ mod tests {
     #[case(IndexType::Mutable)]
     #[case(IndexType::Immutable)]
     #[case(IndexType::Mmap)]
+    #[case(IndexType::RamMmap)]
     fn test_empty_index_cardinality(#[case] index_type: IndexType) {
         let polygon = GeoPolygon {
             exterior: GeoLineString {
@@ -1483,6 +1529,7 @@ mod tests {
     #[case(IndexType::Mutable)]
     #[case(IndexType::Immutable)]
     #[case(IndexType::Mmap)]
+    #[case(IndexType::RamMmap)]
     fn query_across_antimeridian(#[case] index_type: IndexType) {
         let (mut builder, _, _) = create_builder(index_type);
         // Index BERLIN
@@ -1540,5 +1587,119 @@ mod tests {
             .collect_vec();
         // Only LOS_ANGELES is in the bounding box
         assert_eq!(point_offsets, vec![2]);
+    }
+
+    #[rstest]
+    #[case(&[IndexType::Mutable, IndexType::Immutable, IndexType::Mmap, IndexType::RamMmap], false)]
+    #[case(&[IndexType::Mutable, IndexType::Immutable, IndexType::RamMmap], true)]
+    fn test_congruence(#[case] types: &[IndexType], #[case] deleted: bool) {
+        const POINT_COUNT: usize = 500;
+
+        let (mut indices, _data): (Vec<_>, Vec<_>) = types
+            .iter()
+            .copied()
+            .map(|index_type| {
+                let (index, temp_dir, db) = build_random_index(POINT_COUNT, 20, index_type);
+                (index, (temp_dir, db))
+            })
+            .unzip();
+
+        let polygon = GeoPolygon {
+            exterior: GeoLineString {
+                points: vec![
+                    GeoPoint {
+                        lon: 19.415558242000287,
+                        lat: 69.18533258102943,
+                    },
+                    GeoPoint {
+                        lon: 2.4664944437317615,
+                        lat: 61.852748225727254,
+                    },
+                    GeoPoint {
+                        lon: 2.713789718828849,
+                        lat: 51.80793869181895,
+                    },
+                    GeoPoint {
+                        lon: 19.415558242000287,
+                        lat: 69.18533258102943,
+                    },
+                ],
+            },
+            interiors: None,
+        };
+        let hashes = polygon_hashes(&polygon, GEO_QUERY_MAX_REGION).unwrap();
+
+        if deleted {
+            for index in indices.iter_mut() {
+                index.remove_point(10).unwrap();
+                index.remove_point(11).unwrap();
+                index.remove_point(12).unwrap();
+                index.remove_point(100).unwrap();
+                index.remove_point(150).unwrap();
+            }
+        }
+
+        for index in &indices[1..] {
+            assert_eq!(indices[0].points_count(), index.points_count());
+            if !deleted {
+                assert_eq!(
+                    indices[0].points_values_count(),
+                    index.points_values_count(),
+                );
+            }
+            assert_eq!(
+                indices[0].max_values_per_point(),
+                index.max_values_per_point(),
+            );
+            let hw_counter = HardwareCounterCell::disposable();
+            for hash in &hashes {
+                assert_eq!(
+                    indices[0].points_of_hash(hash, &hw_counter),
+                    index.points_of_hash(hash, &hw_counter),
+                );
+                assert_eq!(
+                    indices[0].values_of_hash(hash, &hw_counter),
+                    index.values_of_hash(hash, &hw_counter),
+                );
+            }
+            assert_eq!(
+                indices[0]
+                    .large_hashes(20)
+                    .map(|(hash, _)| hash)
+                    .collect::<BTreeSet<_>>(),
+                index
+                    .large_hashes(20)
+                    .map(|(hash, _)| hash)
+                    .collect::<BTreeSet<_>>(),
+            );
+            assert_eq!(
+                indices[0].iterator(hashes.clone()).collect::<HashSet<_>>(),
+                index.iterator(hashes.clone()).collect::<HashSet<_>>(),
+            );
+            for point_id in 0..POINT_COUNT {
+                assert_eq!(
+                    indices[0].values_count(point_id as PointOffsetType),
+                    index.values_count(point_id as PointOffsetType),
+                );
+                if !deleted {
+                    assert_eq!(
+                        indices[0]
+                            .get_values(point_id as PointOffsetType)
+                            .unwrap()
+                            .map(OrderedGeoPoint::from)
+                            .collect::<BTreeSet<_>>(),
+                        index
+                            .get_values(point_id as PointOffsetType)
+                            .unwrap()
+                            .map(OrderedGeoPoint::from)
+                            .collect::<BTreeSet<_>>(),
+                    );
+                }
+                assert_eq!(
+                    indices[0].values_is_empty(point_id as PointOffsetType),
+                    index.values_is_empty(point_id as PointOffsetType),
+                );
+            }
+        }
     }
 }

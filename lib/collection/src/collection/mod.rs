@@ -116,7 +116,7 @@ impl Collection {
         update_runtime: Option<Handle>,
         optimizer_resource_budget: ResourceBudget,
         optimizers_overwrite: Option<OptimizersConfigDiff>,
-    ) -> Result<Self, CollectionError> {
+    ) -> CollectionResult<Self> {
         let start_time = std::time::Instant::now();
 
         let mut shard_holder = ShardHolder::new(path)?;
@@ -578,6 +578,10 @@ impl Collection {
                     state.key(),
                 );
             }
+        }
+
+        for transfer in self.get_related_transfers(peer_id).await {
+            self.abort_shard_transfer(transfer.key(), None).await?;
         }
 
         self.shards_holder

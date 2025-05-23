@@ -2,13 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use common::budget::{ResourceBudget, ResourcePermit};
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::disk::dir_size;
 use io::storage_version::StorageVersion;
 use itertools::Itertools;
+use parking_lot::lock_api::RwLockWriteGuard;
 use parking_lot::{Mutex, RwLockUpgradableReadGuard};
 use segment::common::operation_error::{OperationResult, check_process_stopped};
 use segment::common::operation_time_statistics::{
@@ -23,7 +24,7 @@ use segment::types::{HnswConfig, Indexes, QuantizationConfig, SegmentConfig, Vec
 
 use crate::collection_manager::holders::proxy_segment::{self, ProxyIndexChange, ProxySegment};
 use crate::collection_manager::holders::segment_holder::{
-    LockedSegment, LockedSegmentHolder, SegmentId,
+    LockedSegment, LockedSegmentHolder, SegmentHolder, SegmentId,
 };
 use crate::config::CollectionParams;
 use crate::operations::config_diff::DiffConfig;
@@ -237,8 +238,10 @@ pub trait SegmentOptimizer {
             });
         }
 
-        // If storing on disk, set storage type in current segment (not in collection config)
-        if threshold_is_on_disk {
+        // We want to use single-file mmap in the following cases:
+        // - It is explicitly configured by `mmap_threshold` -> threshold_is_on_disk=true
+        // - The segment is indexed and configured on disk -> threshold_is_indexed=true && config_on_disk=Some(true)
+        if threshold_is_on_disk || threshold_is_indexed {
             vector_data.iter_mut().for_each(|(vector_name, config)| {
                 // Check whether on_disk is explicitly configured, if not, set it to true
                 let config_on_disk = collection_params
@@ -249,7 +252,7 @@ pub trait SegmentOptimizer {
                 match config_on_disk {
                     Some(true) => config.storage_type = VectorStorageType::Mmap, // Both agree, but prefer mmap storage type
                     Some(false) => {} // on_disk=false wins, do nothing
-                    None => config.storage_type = VectorStorageType::Mmap, // Mmap threshold wins
+                    None => if threshold_is_on_disk { config.storage_type = VectorStorageType::Mmap }, // Mmap threshold wins
                 }
 
                 // If we explicitly configure on_disk, but the segment storage type uses something
@@ -339,17 +342,7 @@ pub trait SegmentOptimizer {
         restored_segment_ids
     }
 
-    /// Checks if optimization cancellation is requested.
-    fn check_cancellation(&self, stopped: &AtomicBool) -> CollectionResult<()> {
-        if stopped.load(Ordering::Relaxed) {
-            return Err(CollectionError::Cancelled {
-                description: "optimization cancelled by service".to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Unwraps proxy, adds temp segment into collection and returns a `Cancelled` error.
+    /// Unwraps proxy, adds temp segment into collection
     ///
     /// # Arguments
     ///
@@ -406,7 +399,7 @@ pub trait SegmentOptimizer {
     ) -> CollectionResult<Segment> {
         let mut segment_builder = self.optimized_segment_builder(optimizing_segments)?;
 
-        self.check_cancellation(stopped)?;
+        check_process_stopped(stopped)?;
 
         let segments: Vec<_> = optimizing_segments
             .iter()
@@ -453,6 +446,9 @@ pub trait SegmentOptimizer {
                 }
                 ProxyIndexChange::Delete(_) => {
                     segment_builder.remove_indexed_field(field_name);
+                }
+                ProxyIndexChange::DeleteIfIncompatible(_, schema) => {
+                    segment_builder.remove_index_field_if_incompatible(field_name, schema);
                 }
             }
         }
@@ -502,8 +498,9 @@ pub trait SegmentOptimizer {
                 description: "optimization cancelled while waiting for budget".to_string(),
             })?;
 
+        let mut rng = rand::rng();
         let mut optimized_segment: Segment =
-            segment_builder.build(indexing_permit, stopped, hw_counter)?;
+            segment_builder.build(indexing_permit, stopped, &mut rng, hw_counter)?;
 
         // Delete points
         let deleted_points_snapshot = proxy_deleted_points
@@ -532,8 +529,12 @@ pub trait SegmentOptimizer {
                 ProxyIndexChange::Delete(version) => {
                     optimized_segment.delete_field_index(*version, field_name)?;
                 }
+                ProxyIndexChange::DeleteIfIncompatible(version, schema) => {
+                    optimized_segment
+                        .delete_field_index_if_incompatible(*version, field_name, schema)?;
+                }
             }
-            self.check_cancellation(stopped)?;
+            check_process_stopped(stopped)?;
         }
 
         for (point_id, versions) in deleted_points_snapshot {
@@ -545,9 +546,11 @@ pub trait SegmentOptimizer {
         Ok(optimized_segment)
     }
 
-    /// Performs optimization of collections's segments, including:
-    ///     - Segment rebuilding
-    ///     - Segment joining
+    /// Performs optimization of collections's segments
+    ///
+    /// Including:
+    /// * Segment rebuilding
+    /// * Segment joining
     ///
     /// # Arguments
     ///
@@ -647,14 +650,9 @@ pub trait SegmentOptimizer {
             proxy_ids
         };
 
-        if let Err(e) = check_process_stopped(stopped) {
-            self.handle_cancellation(&segments, &proxy_ids, tmp_segment)?;
-            return Err(CollectionError::from(e));
-        }
-
-        // ---- SLOW PART -----
-
-        let mut optimized_segment = match self.build_new_segment(
+        // SLOW PART: create single optimized segment and propagate all new changes to it
+        let result = self.optimize_segment_propagate_changes(
+            &segments,
             &optimizing_segments,
             Arc::clone(&proxy_deleted_points),
             Arc::clone(&proxy_index_changes),
@@ -662,16 +660,101 @@ pub trait SegmentOptimizer {
             resource_budget,
             stopped,
             &hw_counter,
-        ) {
+        );
+        let (optimized_segment, mut write_segments_guard) = match result {
             Ok(segment) => segment,
-            Err(error) => {
-                if matches!(error, CollectionError::Cancelled { .. }) {
-                    self.handle_cancellation(&segments, &proxy_ids, tmp_segment)?;
-                    return Err(error);
-                }
-                return Err(error);
+            Err(err) => {
+                // Properly cancel optimization on all error kinds
+                // Unwrap proxies and add temp segment to holder
+                self.handle_cancellation(&segments, &proxy_ids, tmp_segment)?;
+                return Err(err);
             }
         };
+
+        // Replace proxy segments with new optimized segment
+        let point_count = optimized_segment.available_point_count();
+        let (_, proxies) = write_segments_guard.swap_new(optimized_segment, &proxy_ids);
+        debug_assert_eq!(
+            proxies.len(),
+            proxy_ids.len(),
+            "swapped different number of proxies on unwrap, missing or incorrect segment IDs?",
+        );
+
+        let has_appendable_segments = write_segments_guard.has_appendable_segment();
+
+        // Release reference counter for each optimized segment
+        drop(optimizing_segments);
+
+        // Append a temp segment to collection if it is not empty or there is no other appendable segment
+        if !has_appendable_segments || !tmp_segment.get().read().is_empty() {
+            write_segments_guard.add_new_locked(tmp_segment);
+
+            // Unlock collection for search and updates
+            // After the collection is unlocked - we can remove data as slow as we want
+            drop(write_segments_guard);
+
+            // Only remove data after we ensure the consistency of the collection.
+            // If remove fails - we will still have operational collection with reported error.
+            for proxy in proxies {
+                proxy.drop_data()?;
+            }
+        } else {
+            // Unlock collection for search and updates
+            // After the collection is unlocked - we can remove data as slow as we want
+            drop(write_segments_guard);
+
+            // Proxy contains pointer to the `tmp_segment`, so they should be removed first
+            for proxy in proxies {
+                proxy.drop_data()?;
+            }
+            tmp_segment.drop_data()?;
+        }
+
+        timer.set_success(true);
+
+        Ok(point_count)
+    }
+
+    /// Create a single optimized segment from the given segments.
+    ///
+    /// All point deletes or payload index changes made during optimization are propagated to the
+    /// optimized segment at the very end.
+    ///
+    /// This internally takes a write lock on the segments holder to block new updates when
+    /// finalizing optimization. It is returned so that the optimized segment can be inserted and
+    /// proxy segments can be dissolved before releasing the lock.
+    ///
+    /// # Warning
+    ///
+    /// This function is slow and must only be used on an optimization worker.
+    #[allow(clippy::too_many_arguments)]
+    fn optimize_segment_propagate_changes<'a>(
+        &self,
+        segments: &'a LockedSegmentHolder,
+        optimizing_segments: &[LockedSegment],
+        proxy_deleted_points: proxy_segment::LockedRmSet,
+        proxy_index_changes: proxy_segment::LockedIndexChanges,
+        permit: ResourcePermit, // IO resources for copying data
+        resource_budget: ResourceBudget,
+        stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> CollectionResult<(
+        Segment,
+        RwLockWriteGuard<'a, parking_lot::RawRwLock, SegmentHolder>,
+    )> {
+        check_process_stopped(stopped)?;
+
+        // ---- SLOW PART -----
+
+        let mut optimized_segment = self.build_new_segment(
+            optimizing_segments,
+            Arc::clone(&proxy_deleted_points),
+            Arc::clone(&proxy_index_changes),
+            permit,
+            resource_budget,
+            stopped,
+            hw_counter,
+        )?;
 
         // Avoid unnecessary point removing in the critical section:
         // - save already removed points while avoiding long read locks
@@ -687,96 +770,55 @@ pub trait SegmentOptimizer {
 
         // ---- SLOW PART ENDS HERE -----
 
-        if let Err(e) = check_process_stopped(stopped) {
-            self.handle_cancellation(&segments, &proxy_ids, tmp_segment)?;
-            return Err(CollectionError::from(e));
+        check_process_stopped(stopped)?;
+
+        // This block locks all operations with collection. It should be fast
+        let write_segments_guard = segments.write();
+
+        // Apply index changes before point deletions
+        // Point deletions bump the segment version, can cause index changes to be ignored
+        for (field_name, change) in proxy_index_changes.read().iter_ordered() {
+            // Warn: change version might be lower than the segment version,
+            // because we might already applied the change earlier in optimization.
+            // Applied optimizations are not removed from `proxy_index_changes`.
+            match change {
+                ProxyIndexChange::Create(schema, version) => {
+                    optimized_segment.create_field_index(
+                        *version,
+                        field_name,
+                        Some(schema),
+                        hw_counter,
+                    )?;
+                }
+                ProxyIndexChange::Delete(version) => {
+                    optimized_segment.delete_field_index(*version, field_name)?;
+                }
+                ProxyIndexChange::DeleteIfIncompatible(version, schema) => {
+                    optimized_segment
+                        .delete_field_index_if_incompatible(*version, field_name, schema)?;
+                }
+            }
+
+            check_process_stopped(stopped)?;
         }
 
-        {
-            // This block locks all operations with collection. It should be fast
-            let mut write_segments_guard = segments.write();
-
-            // Apply index changes before point deletions
-            // Point deletions bump the segment version, can cause index changes to be ignored
-            for (field_name, change) in proxy_index_changes.read().iter_ordered() {
-                // Warn: change version might be lower than the segment version,
-                // because we might already applied the change earlier in optimization.
-                // Applied optimizations are not removed from `proxy_index_changes`.
-                match change {
-                    ProxyIndexChange::Create(schema, version) => {
-                        optimized_segment.create_field_index(
-                            *version,
-                            field_name,
-                            Some(schema),
-                            &hw_counter,
-                        )?;
-                    }
-                    ProxyIndexChange::Delete(version) => {
-                        optimized_segment.delete_field_index(*version, field_name)?;
-                    }
-                }
-                self.check_cancellation(stopped)?;
-            }
-
-            let deleted_points = proxy_deleted_points.read();
-            let points_diff = deleted_points
-                .iter()
-                .filter(|&(point_id, _version)| !already_remove_points.contains(point_id));
-            for (&point_id, &versions) in points_diff {
-                // Delete points here with their operation version, that'll bump the optimized
-                // segment version and will ensure we flush the new changes
-                debug_assert!(
-                    versions.operation_version
-                        >= optimized_segment.point_version(point_id).unwrap_or(0),
-                    "proxied point deletes should have newer version than point in segment",
-                );
-                optimized_segment
-                    .delete_point(versions.operation_version, point_id, &hw_counter)
-                    .unwrap();
-            }
-
-            let point_count = optimized_segment.available_point_count();
-
-            let (_, proxies) = write_segments_guard.swap_new(optimized_segment, &proxy_ids);
-            debug_assert_eq!(
-                proxies.len(),
-                proxy_ids.len(),
-                "swapped different number of proxies on unwrap, missing or incorrect segment IDs?",
+        let deleted_points = proxy_deleted_points.read();
+        let points_diff = deleted_points
+            .iter()
+            .filter(|&(point_id, _version)| !already_remove_points.contains(point_id));
+        for (&point_id, &versions) in points_diff {
+            // Delete points here with their operation version, that'll bump the optimized
+            // segment version and will ensure we flush the new changes
+            debug_assert!(
+                versions.operation_version
+                    >= optimized_segment.point_version(point_id).unwrap_or(0),
+                "proxied point deletes should have newer version than point in segment",
             );
-
-            let has_appendable_segments = write_segments_guard.has_appendable_segment();
-
-            // Release reference counter of the optimized segments
-            drop(optimizing_segments);
-
-            // Append a temp segment to collection if it is not empty or there is no other appendable segment
-            if !has_appendable_segments || !tmp_segment.get().read().is_empty() {
-                write_segments_guard.add_new_locked(tmp_segment);
-
-                // unlock collection for search and updates
-                drop(write_segments_guard);
-                // After the collection is unlocked - we can remove data as slow as we want.
-
-                // Only remove data after we ensure the consistency of the collection.
-                // If remove fails - we will still have operational collection with reported error.
-                for proxy in proxies {
-                    proxy.drop_data()?;
-                }
-            } else {
-                // unlock collection for search and updates
-                drop(write_segments_guard);
-                // After the collection is unlocked - we can remove data as slow as we want.
-
-                // Proxy contains pointer to the `tmp_segment`, so they should be removed first
-                for proxy in proxies {
-                    proxy.drop_data()?;
-                }
-                tmp_segment.drop_data()?;
-            }
-
-            timer.set_success(true);
-
-            Ok(point_count)
+            optimized_segment
+                .delete_point(versions.operation_version, point_id, hw_counter)
+                .unwrap();
         }
+
+        Ok((optimized_segment, write_segments_guard))
     }
 }

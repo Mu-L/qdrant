@@ -12,7 +12,6 @@ use gridstore::config::{Compression, StorageOptions};
 use parking_lot::RwLock;
 use sparse::common::sparse_vector::SparseVector;
 
-use super::simple_sparse_vector_storage::SPARSE_VECTOR_DISTANCE;
 use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::vectors::VectorRef;
@@ -204,11 +203,20 @@ impl SparseVectorStorage for MmapSparseVectorStorage {
             .map(SparseVector::try_from)
             .transpose()
     }
+
+    fn get_sparse_sequential(&self, key: PointOffsetType) -> OperationResult<SparseVector> {
+        let stored_sparse = self
+            .storage
+            .read()
+            .get_value_sequential(key, &HardwareCounterCell::disposable())
+            .ok_or_else(|| OperationError::service_error(format!("Key {key} not found")))?;
+        SparseVector::try_from(stored_sparse)
+    }
 }
 
 impl VectorStorage for MmapSparseVectorStorage {
     fn distance(&self) -> crate::types::Distance {
-        SPARSE_VECTOR_DISTANCE
+        super::SPARSE_VECTOR_DISTANCE
     }
 
     fn datatype(&self) -> crate::types::VectorStorageDatatype {
@@ -226,6 +234,12 @@ impl VectorStorage for MmapSparseVectorStorage {
     fn get_vector(&self, key: PointOffsetType) -> CowVector {
         let vector = self.get_vector_opt(key);
         vector.unwrap_or_else(CowVector::default_sparse)
+    }
+
+    fn get_vector_sequential(&self, key: PointOffsetType) -> CowVector {
+        self.get_sparse_sequential(key)
+            .map(CowVector::from)
+            .unwrap_or_else(|_| CowVector::default_sparse())
     }
 
     /// Get vector by key, if it exists.

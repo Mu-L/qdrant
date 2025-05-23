@@ -17,8 +17,8 @@ use segment::segment::Segment;
 use segment::segment_constructor::segment_builder::SegmentBuilder;
 use segment::segment_constructor::simple_segment_constructor::build_simple_segment_with_payload_storage;
 use segment::types::{
-    Distance, Indexes, PayloadContainer, PayloadKeyType, PayloadStorageType, SegmentConfig,
-    VectorDataConfig, VectorStorageType,
+    Distance, Indexes, PayloadContainer, PayloadFieldSchema, PayloadKeyType, PayloadSchemaType,
+    PayloadStorageType, SegmentConfig, VectorDataConfig, VectorStorageType,
 };
 use serde_json::Value;
 use sparse::common::sparse_vector::SparseVector;
@@ -34,6 +34,7 @@ fn test_building_new_segment() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("segment_temp_dir").tempdir().unwrap();
 
+    let mut rng = rand::rng();
     let stopped = AtomicBool::new(false);
 
     let segment1 = build_segment_1(dir.path());
@@ -74,7 +75,9 @@ fn test_building_new_segment() {
     let permit = ResourcePermit::dummy(permit_cpu_count as u32);
     let hw_counter = HardwareCounterCell::new();
 
-    let merged_segment: Segment = builder.build(permit, &stopped, &hw_counter).unwrap();
+    let merged_segment: Segment = builder
+        .build(permit, &stopped, &mut rng, &hw_counter)
+        .unwrap();
 
     let new_segment_count = dir.path().read_dir().unwrap().count();
 
@@ -101,20 +104,23 @@ fn test_building_new_defragmented_segment() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("segment_temp_dir").tempdir().unwrap();
 
+    let mut rng = rand::rng();
     let stopped = AtomicBool::new(false);
 
     let defragment_key = JsonPath::from_str(PAYLOAD_KEY).unwrap();
 
     let hw_counter = HardwareCounterCell::new();
 
+    let payload_schema = PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword);
+
     let mut segment1 = build_segment_1(dir.path());
     segment1
-        .create_field_index(7, &defragment_key, None, &hw_counter)
+        .create_field_index(7, &defragment_key, Some(&payload_schema), &hw_counter)
         .unwrap();
 
     let mut segment2 = build_segment_2(dir.path());
     segment2
-        .create_field_index(17, &defragment_key, None, &hw_counter)
+        .create_field_index(17, &defragment_key, Some(&payload_schema), &hw_counter)
         .unwrap();
 
     let mut builder =
@@ -150,7 +156,9 @@ fn test_building_new_defragmented_segment() {
     let permit = ResourcePermit::dummy(permit_cpu_count as u32);
     let hw_counter = HardwareCounterCell::new();
 
-    let merged_segment: Segment = builder.build(permit, &stopped, &hw_counter).unwrap();
+    let merged_segment: Segment = builder
+        .build(permit, &stopped, &mut rng, &hw_counter)
+        .unwrap();
 
     let new_segment_count = dir.path().read_dir().unwrap().count();
 
@@ -234,6 +242,7 @@ fn test_building_new_sparse_segment() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("segment_temp_dir").tempdir().unwrap();
 
+    let mut rng = rand::rng();
     let stopped = AtomicBool::new(false);
 
     let hw_counter = HardwareCounterCell::new();
@@ -275,7 +284,9 @@ fn test_building_new_sparse_segment() {
     let permit = ResourcePermit::dummy(permit_cpu_count as u32);
     let hw_counter = HardwareCounterCell::new();
 
-    let merged_segment: Segment = builder.build(permit, &stopped, &hw_counter).unwrap();
+    let merged_segment: Segment = builder
+        .build(permit, &stopped, &mut rng, &hw_counter)
+        .unwrap();
 
     let new_segment_count = dir.path().read_dir().unwrap().count();
 
@@ -298,6 +309,7 @@ fn test_building_new_sparse_segment() {
 }
 
 fn estimate_build_time(segment: &Segment, stop_delay_millis: Option<u64>) -> (u64, bool) {
+    let mut rng = rand::rng();
     let stopped = Arc::new(AtomicBool::new(false));
 
     let dir = Builder::new().prefix("segment_dir1").tempdir().unwrap();
@@ -342,7 +354,7 @@ fn estimate_build_time(segment: &Segment, stop_delay_millis: Option<u64>) -> (u6
     let permit = ResourcePermit::dummy(permit_cpu_count as u32);
     let hw_counter = HardwareCounterCell::new();
 
-    let res = builder.build(permit, &stopped, &hw_counter);
+    let res = builder.build(permit, &stopped, &mut rng, &hw_counter);
 
     let is_cancelled = match res {
         Ok(_) => false,
@@ -364,6 +376,7 @@ fn test_building_new_segment_bug_5614() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("segment_temp_dir").tempdir().unwrap();
 
+    let mut rng = rand::rng();
     let stopped = AtomicBool::new(false);
 
     let mut segment1 = build_segment_1(dir.path());
@@ -403,7 +416,9 @@ fn test_building_new_segment_bug_5614() {
     let permit = ResourcePermit::dummy(permit_cpu_count as u32);
     let hw_counter = HardwareCounterCell::new();
 
-    let merged_segment: Segment = builder.build(permit, &stopped, &hw_counter).unwrap();
+    let merged_segment: Segment = builder
+        .build(permit, &stopped, &mut rng, &hw_counter)
+        .unwrap();
 
     // Assert correct point versions - must have latest
     assert_eq!(merged_segment.point_version(100.into()), Some(124));
@@ -499,6 +514,7 @@ fn test_building_new_segment_with_mmap_payload() {
     let segment_dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("segment_temp_dir").tempdir().unwrap();
 
+    let mut rng = rand::rng();
     let stopped = AtomicBool::new(false);
 
     let mut segment1 = build_simple_segment_with_payload_storage(
@@ -542,7 +558,9 @@ fn test_building_new_segment_with_mmap_payload() {
     let permit = ResourcePermit::dummy(permit_cpu_count as u32);
     let hw_counter = HardwareCounterCell::new();
 
-    let new_segment: Segment = builder.build(permit, &stopped, &hw_counter).unwrap();
+    let new_segment: Segment = builder
+        .build(permit, &stopped, &mut rng, &hw_counter)
+        .unwrap();
     assert_eq!(
         new_segment.segment_config.payload_storage_type,
         PayloadStorageType::Mmap

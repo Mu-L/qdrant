@@ -11,6 +11,7 @@ use memory::mmap_ops;
 use memory::mmap_type::{MmapBitSlice, MmapSlice};
 use mmap_postings::MmapPostings;
 
+use super::compressed_posting::compressed_chunks_reader::ChunkReader;
 use super::inverted_index::{InvertedIndex, ParsedQuery};
 use super::postings_iterator::intersect_compressed_postings_iterator;
 use crate::common::mmap_bitslice_buffered_update_wrapper::MmapBitSliceBufferedUpdateWrapper;
@@ -117,13 +118,22 @@ impl MmapInvertedIndex {
         })
     }
 
-    fn iter_vocab(&self) -> impl Iterator<Item = (&str, &TokenId)> {
+    pub(super) fn iter_vocab(&self) -> impl Iterator<Item = (&str, &TokenId)> {
         // unwrap safety: we know that each token points to a token id.
         self.vocab.iter().map(|(k, v)| (k, v.first().unwrap()))
     }
 
+    /// Iterate over posting lists, returning chunk reader for each
+    #[inline]
+    pub(super) fn iter_postings<'a>(
+        &'a self,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> impl Iterator<Item = Option<ChunkReader<'a>>> {
+        self.postings.iter_postings(hw_counter)
+    }
+
     /// Returns whether the point id is valid and active.
-    fn is_active(&self, point_id: PointOffsetType) -> bool {
+    pub fn is_active(&self, point_id: PointOffsetType) -> bool {
         let is_deleted = self.deleted_points.get(point_id as usize).unwrap_or(true);
 
         !is_deleted
@@ -206,20 +216,16 @@ impl InvertedIndex for MmapInvertedIndex {
         let postings_opt: Option<Vec<_>> = query
             .tokens
             .iter()
-            .map(|&token_id| match token_id {
-                None => None,
-                // if a ParsedQuery token was given an index, then it must exist in the vocabulary
-                Some(idx) => self.postings.get(idx, hw_counter),
-            })
+            .map(|&token_id| self.postings.get(token_id, hw_counter))
             .collect();
         let Some(posting_readers) = postings_opt else {
             // There are unseen tokens -> no matches
-            return Box::new(vec![].into_iter());
+            return Box::new(std::iter::empty());
         };
 
         if posting_readers.is_empty() {
             // Empty request -> no matches
-            return Box::new(vec![].into_iter());
+            return Box::new(std::iter::empty());
         }
 
         // in case of mmap immutable index, deleted points are still in the postings
@@ -252,24 +258,23 @@ impl InvertedIndex for MmapInvertedIndex {
         point_id: PointOffsetType,
         hw_counter: &HardwareCounterCell,
     ) -> bool {
-        if parsed_query.tokens.contains(&None) {
+        // check non-empty query
+        if parsed_query.tokens.is_empty() {
             return false;
         }
+
         // check presence of the document
         if self.values_is_empty(point_id) {
             return false;
         }
         // Check that all tokens are in document
-        parsed_query
-            .tokens
-            .iter()
-            // unwrap safety: all tokens exist in the vocabulary if it passes the above check
-            .all(|query_token| {
-                self.postings
-                    .get(query_token.unwrap(), hw_counter)
-                    .unwrap()
-                    .contains(point_id)
-            })
+        parsed_query.tokens.iter().all(|query_token| {
+            self.postings
+                .get(*query_token, hw_counter)
+                // unwrap safety: all tokens exist in the vocabulary, otherwise there'd be no query tokens
+                .unwrap()
+                .contains(point_id)
+        })
     }
 
     fn values_is_empty(&self, point_id: PointOffsetType) -> bool {

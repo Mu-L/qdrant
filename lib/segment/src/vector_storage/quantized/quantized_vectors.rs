@@ -2,7 +2,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use bitvec::slice::BitSlice;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use io::file_operations::{atomic_save_json, read_json};
@@ -167,16 +166,12 @@ impl QuantizedVectors {
     pub fn raw_scorer<'a>(
         &'a self,
         query: QueryVector,
-        point_deleted: &'a BitSlice,
-        vec_deleted: &'a BitSlice,
         hardware_counter: HardwareCounterCell,
     ) -> OperationResult<Box<dyn RawScorer + 'a>> {
         QuantizedScorerBuilder::new(
             &self.storage_impl,
             &self.config.quantization_config,
             query,
-            point_deleted,
-            vec_deleted,
             &self.distance,
             self.datatype,
             hardware_counter,
@@ -244,13 +239,28 @@ impl QuantizedVectors {
         stopped: &AtomicBool,
     ) -> OperationResult<Self> {
         match vector_storage {
+            #[cfg(feature = "rocksdb")]
             VectorStorageEnum::DenseSimple(v) => {
                 Self::create_impl(v, quantization_config, path, max_threads, stopped)
             }
+            #[cfg(feature = "rocksdb")]
             VectorStorageEnum::DenseSimpleByte(v) => {
                 Self::create_impl(v, quantization_config, path, max_threads, stopped)
             }
+            #[cfg(feature = "rocksdb")]
             VectorStorageEnum::DenseSimpleHalf(v) => {
+                Self::create_impl(v, quantization_config, path, max_threads, stopped)
+            }
+            #[cfg(test)]
+            VectorStorageEnum::DenseVolatile(v) => {
+                Self::create_impl(v, quantization_config, path, max_threads, stopped)
+            }
+            #[cfg(test)]
+            VectorStorageEnum::DenseVolatileByte(v) => {
+                Self::create_impl(v, quantization_config, path, max_threads, stopped)
+            }
+            #[cfg(test)]
+            VectorStorageEnum::DenseVolatileHalf(v) => {
                 Self::create_impl(v, quantization_config, path, max_threads, stopped)
             }
             VectorStorageEnum::DenseMemmap(v) => {
@@ -280,15 +290,33 @@ impl QuantizedVectors {
             VectorStorageEnum::DenseAppendableInRamHalf(v) => {
                 Self::create_impl(v.as_ref(), quantization_config, path, max_threads, stopped)
             }
+            #[cfg(feature = "rocksdb")]
             VectorStorageEnum::SparseSimple(_) => Err(OperationError::WrongSparse),
+            #[cfg(test)]
+            VectorStorageEnum::SparseVolatile(_) => Err(OperationError::WrongSparse),
             VectorStorageEnum::SparseMmap(_) => Err(OperationError::WrongSparse),
+            #[cfg(feature = "rocksdb")]
             VectorStorageEnum::MultiDenseSimple(v) => {
                 Self::create_multi_impl(v, quantization_config, path, max_threads, stopped)
             }
+            #[cfg(feature = "rocksdb")]
             VectorStorageEnum::MultiDenseSimpleByte(v) => {
                 Self::create_multi_impl(v, quantization_config, path, max_threads, stopped)
             }
+            #[cfg(feature = "rocksdb")]
             VectorStorageEnum::MultiDenseSimpleHalf(v) => {
+                Self::create_multi_impl(v, quantization_config, path, max_threads, stopped)
+            }
+            #[cfg(test)]
+            VectorStorageEnum::MultiDenseVolatile(v) => {
+                Self::create_multi_impl(v, quantization_config, path, max_threads, stopped)
+            }
+            #[cfg(test)]
+            VectorStorageEnum::MultiDenseVolatileByte(v) => {
+                Self::create_multi_impl(v, quantization_config, path, max_threads, stopped)
+            }
+            #[cfg(test)]
+            VectorStorageEnum::MultiDenseVolatileHalf(v) => {
                 Self::create_multi_impl(v, quantization_config, path, max_threads, stopped)
             }
             VectorStorageEnum::MultiDenseAppendableMemmap(v) => {

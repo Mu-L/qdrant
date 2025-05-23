@@ -10,16 +10,15 @@ use std::sync::Arc;
 
 use ahash::AHashSet;
 use common::types::ScoreType;
+use ecow::EcoString;
 use fnv::FnvBuildHasher;
 use geo::{Contains, Coord, Distance as GeoDistance, Haversine, LineString, Point, Polygon};
 use indexmap::IndexSet;
-use itertools::Itertools;
 use merge::Merge;
 use ordered_float::OrderedFloat;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
-use smol_str::SmolStr;
 use strum::EnumIter;
 use uuid::Uuid;
 use validator::{Validate, ValidationError, ValidationErrors};
@@ -1382,11 +1381,10 @@ impl VectorDataConfig {
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Anonymize, Clone, Copy, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SparseVectorStorageType {
-    /// Storage on disk
-    // (rocksdb storage)
+    /// Storage on disk (rocksdb storage)
+    #[cfg(feature = "rocksdb")]
     OnDisk,
-    /// Storage in memory maps
-    // (gridstore storage)
+    /// Storage in memory maps (gridstore storage)
     #[default]
     Mmap,
 }
@@ -1397,6 +1395,7 @@ impl SparseVectorStorageType {
         match self {
             // Both options are on disk, but we keep it explicit for the case if someone adds a new
             // storage type in the future
+            #[cfg(feature = "rocksdb")]
             Self::OnDisk => true,
             Self::Mmap => true,
         }
@@ -1416,8 +1415,15 @@ pub struct SparseVectorDataConfig {
 }
 
 /// If the storage type is not in config, it means it is the OnDisk variant
-const fn default_sparse_vector_storage_type_when_not_in_config() -> SparseVectorStorageType {
-    SparseVectorStorageType::OnDisk
+fn default_sparse_vector_storage_type_when_not_in_config() -> SparseVectorStorageType {
+    #[cfg(feature = "rocksdb")]
+    {
+        SparseVectorStorageType::OnDisk
+    }
+    #[cfg(not(feature = "rocksdb"))]
+    {
+        SparseVectorStorageType::default()
+    }
 }
 
 impl SparseVectorDataConfig {
@@ -1508,6 +1514,24 @@ impl TryFrom<GeoPointShadow> for GeoPoint {
 impl From<GeoPoint> for geo::Point {
     fn from(GeoPoint { lon, lat }: GeoPoint) -> Self {
         Self::new(lon, lat)
+    }
+}
+
+/// Geo point that implements `PartialOrd`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
+#[cfg(test)]
+pub struct OrderedGeoPoint {
+    pub lon: OrderedFloat<f64>,
+    pub lat: OrderedFloat<f64>,
+}
+
+#[cfg(test)]
+impl From<GeoPoint> for OrderedGeoPoint {
+    fn from(geo_point: GeoPoint) -> Self {
+        OrderedGeoPoint {
+            lon: OrderedFloat(geo_point.lon),
+            lat: OrderedFloat(geo_point.lat),
+        }
     }
 }
 
@@ -1775,11 +1799,37 @@ impl PayloadSchemaParams {
     }
 }
 
+impl Validate for PayloadSchemaParams {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            PayloadSchemaParams::Keyword(_) => Ok(()),
+            PayloadSchemaParams::Integer(integer_index_params) => integer_index_params.validate(),
+            PayloadSchemaParams::Float(_) => Ok(()),
+            PayloadSchemaParams::Geo(_) => Ok(()),
+            PayloadSchemaParams::Text(_) => Ok(()),
+            PayloadSchemaParams::Bool(_) => Ok(()),
+            PayloadSchemaParams::Datetime(_) => Ok(()),
+            PayloadSchemaParams::Uuid(_) => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Hash, Eq)]
 #[serde(untagged, rename_all = "snake_case")]
 pub enum PayloadFieldSchema {
     FieldType(PayloadSchemaType),
     FieldParams(PayloadSchemaParams),
+}
+
+impl Validate for PayloadFieldSchema {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            PayloadFieldSchema::FieldType(_) => Ok(()), // nothing to validate
+            PayloadFieldSchema::FieldParams(payload_schema_params) => {
+                payload_schema_params.validate()
+            }
+        }
+    }
 }
 
 impl Display for PayloadFieldSchema {
@@ -1825,6 +1875,34 @@ impl PayloadFieldSchema {
         match self {
             PayloadFieldSchema::FieldType(t) => *t,
             PayloadFieldSchema::FieldParams(p) => p.kind(),
+        }
+    }
+
+    /// Check if this type supports a `match` condition
+    pub fn supports_match(&self) -> bool {
+        match self {
+            PayloadFieldSchema::FieldType(payload_schema_type) => match payload_schema_type {
+                PayloadSchemaType::Keyword => true,
+                PayloadSchemaType::Integer => true,
+                PayloadSchemaType::Uuid => true,
+                PayloadSchemaType::Bool => true,
+                PayloadSchemaType::Float => false,
+                PayloadSchemaType::Geo => false,
+                PayloadSchemaType::Text => false,
+                PayloadSchemaType::Datetime => false,
+            },
+            PayloadFieldSchema::FieldParams(payload_schema_params) => match payload_schema_params {
+                PayloadSchemaParams::Keyword(_) => true,
+                PayloadSchemaParams::Integer(integer_index_params) => {
+                    integer_index_params.lookup == Some(true)
+                }
+                PayloadSchemaParams::Uuid(_) => true,
+                PayloadSchemaParams::Bool(_) => true,
+                PayloadSchemaParams::Float(_) => false,
+                PayloadSchemaParams::Geo(_) => false,
+                PayloadSchemaParams::Text(_) => false,
+                PayloadSchemaParams::Datetime(_) => false,
+            },
         }
     }
 }
@@ -1880,25 +1958,6 @@ pub fn value_type(value: &Value) -> Option<PayloadSchemaType> {
             }
             None
         }
-    }
-}
-
-pub fn infer_value_type(value: &Value) -> Option<PayloadSchemaType> {
-    match value {
-        Value::Array(array) => infer_collection_value_type(array),
-        _ => value_type(value),
-    }
-}
-
-pub fn infer_collection_value_type<'a, I>(values: I) -> Option<PayloadSchemaType>
-where
-    I: IntoIterator<Item = &'a Value>,
-{
-    let possible_types = values.into_iter().map(value_type).unique().collect_vec();
-    if possible_types.len() != 1 {
-        None // There is an ambiguity or empty array
-    } else {
-        possible_types.into_iter().next().unwrap()
     }
 }
 
@@ -2050,8 +2109,8 @@ impl From<String> for Match {
     }
 }
 
-impl From<SmolStr> for Match {
-    fn from(keyword: SmolStr) -> Self {
+impl From<EcoString> for Match {
+    fn from(keyword: EcoString) -> Self {
         Self::Value(MatchValue {
             value: ValueVariants::String(keyword.into()),
         })
@@ -2185,6 +2244,18 @@ impl ValuesCount {
         };
 
         self.check_count(count)
+    }
+}
+
+#[cfg(test)]
+impl From<std::ops::Range<usize>> for ValuesCount {
+    fn from(range: std::ops::Range<usize>) -> Self {
+        Self {
+            gte: Some(range.start),
+            lt: Some(range.end),
+            gt: None,
+            lte: None,
+        }
     }
 }
 
@@ -2474,7 +2545,7 @@ impl FieldCondition {
         }
     }
 
-    pub fn new_is_empty(key: PayloadKeyType) -> Self {
+    pub fn new_is_empty(key: PayloadKeyType, is_empty: bool) -> Self {
         Self {
             key,
             r#match: None,
@@ -2483,12 +2554,12 @@ impl FieldCondition {
             geo_radius: None,
             geo_polygon: None,
             values_count: None,
-            is_empty: Some(true),
+            is_empty: Some(is_empty),
             is_null: None,
         }
     }
 
-    pub fn new_is_null(key: PayloadKeyType) -> Self {
+    pub fn new_is_null(key: PayloadKeyType, is_null: bool) -> Self {
         Self {
             key,
             r#match: None,
@@ -2498,7 +2569,7 @@ impl FieldCondition {
             geo_polygon: None,
             values_count: None,
             is_empty: None,
-            is_null: Some(true),
+            is_null: Some(is_null),
         }
     }
 
@@ -2720,6 +2791,17 @@ impl Condition {
             | Condition::CustomIdChecker(_)
             | Condition::HasId(_)
             | Condition::HasVector(_) => 0,
+        }
+    }
+
+    pub fn targeted_key(&self) -> Option<PayloadKeyType> {
+        match self {
+            Condition::Field(field_condition) => Some(field_condition.key.clone()),
+            Condition::IsEmpty(is_empty_condition) => Some(is_empty_condition.is_empty.key.clone()),
+            Condition::IsNull(is_null_condition) => Some(is_null_condition.is_null.key.clone()),
+            Condition::Nested(nested_condition) => Some(nested_condition.array_key()),
+            Condition::Filter(filter) => filter.iter_conditions().find_map(|c| c.targeted_key()),
+            Condition::HasId(_) | Condition::HasVector(_) | Condition::CustomIdChecker(_) => None,
         }
     }
 }
@@ -3197,6 +3279,7 @@ pub(crate) mod test_utils {
 
 #[cfg(test)]
 mod tests {
+    use itertools::Itertools;
     use rstest::rstest;
     use serde::de::DeserializeOwned;
     use serde_json;
@@ -4337,8 +4420,11 @@ fn shard_key_number_example() -> u64 {
 #[derive(Deserialize, Serialize, JsonSchema, Anonymize, Debug, Clone, PartialEq, Eq, Hash)]
 #[serde(untagged)]
 pub enum ShardKey {
-    #[schemars(example = "shard_key_string_example")]
-    Keyword(String),
+    #[schemars(
+        schema_with = "String::json_schema",
+        example = "shard_key_string_example"
+    )]
+    Keyword(EcoString),
     #[schemars(example = "shard_key_number_example")]
     #[anonymize(false)]
     Number(u64),
@@ -4346,13 +4432,19 @@ pub enum ShardKey {
 
 impl From<String> for ShardKey {
     fn from(s: String) -> Self {
+        ShardKey::Keyword(EcoString::from(s))
+    }
+}
+
+impl From<EcoString> for ShardKey {
+    fn from(s: EcoString) -> Self {
         ShardKey::Keyword(s)
     }
 }
 
 impl From<&str> for ShardKey {
     fn from(s: &str) -> Self {
-        ShardKey::Keyword(s.to_owned())
+        ShardKey::Keyword(EcoString::from(s))
     }
 }
 

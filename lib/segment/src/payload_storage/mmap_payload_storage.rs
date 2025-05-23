@@ -160,6 +160,21 @@ impl PayloadStorage for MmapPayloadStorage {
         }
     }
 
+    fn get_sequential(
+        &self,
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload> {
+        match self
+            .storage
+            .read()
+            .get_value_sequential(point_id, hw_counter)
+        {
+            Some(payload) => Ok(payload),
+            None => Ok(Default::default()),
+        }
+    }
+
     fn delete(
         &mut self,
         point_id: PointOffsetType,
@@ -220,8 +235,7 @@ impl PayloadStorage for MmapPayloadStorage {
             |point_id, payload| {
                 callback(point_id, payload).map_err(|e|
                     // TODO return proper error
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    std::io::Error::other(
                         e.to_string(),
                     ))
             },

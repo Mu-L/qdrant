@@ -40,13 +40,21 @@ impl ShardReplicaSet {
         temp_path: &Path,
         tar: &tar_ext::BuilderExt,
         format: SnapshotFormat,
+        manifest: Option<SegmentManifests>,
         save_wal: bool,
     ) -> CollectionResult<()> {
         let local_read = self.local.read().await;
 
+        // Track concurrent `create_partial_snapshot` requests, so that cluster manager can load-balance them
+        let _partial_snapshot_create_request_guard = if manifest.is_some() {
+            Some(self.partial_snapshot_meta.track_create_snapshot_request())
+        } else {
+            None
+        };
+
         if let Some(local) = &*local_read {
             local
-                .create_snapshot(temp_path, tar, format, save_wal)
+                .create_snapshot(temp_path, tar, format, manifest, save_wal)
                 .await?
         }
 
@@ -57,6 +65,22 @@ impl ShardReplicaSet {
         let shard_config = ShardConfig::new_replica_set();
         shard_config.save_to_tar(tar).await?;
         Ok(())
+    }
+
+    pub fn try_take_partial_snapshot_recovery_lock(
+        &self,
+    ) -> CollectionResult<tokio::sync::OwnedMutexGuard<()>> {
+        self.partial_snapshot_meta.try_take_recovery_lock()
+    }
+
+    pub async fn take_search_write_lock(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.partial_snapshot_meta.take_search_write_lock().await
+    }
+
+    pub fn try_take_search_read_lock(
+        &self,
+    ) -> CollectionResult<tokio::sync::OwnedRwLockReadGuard<()>> {
+        self.partial_snapshot_meta.try_take_search_read_lock()
     }
 
     pub fn restore_snapshot(
@@ -245,7 +269,7 @@ impl ShardReplicaSet {
             None => {
                 return Err(CollectionError::bad_request(format!(
                     "failed to restore partial shard snapshot for shard {}:{}: \
-                     shard does not exist on peer {}",
+                     local shard does not exist on peer {}",
                     self.collection_id,
                     self.shard_id,
                     self.this_peer_id(),
@@ -256,29 +280,38 @@ impl ShardReplicaSet {
         // Try to restore local replica from specified shard snapshot directory
         let restore = async {
             if let Some(local_manifests) = local_manifests {
+                let segments_path = LocalShard::segments_path(&self.shard_path);
+
                 for (segment_id, local_manifest) in local_manifests.iter() {
                     let segment_path = segments_path.join(segment_id);
 
+                    log::debug!("Cleaning up segment {}", segment_path.display());
+
                     // Delete local segment, if it's not present in partial snapshot
                     let Some(snapshot_manifest) = snapshot_manifests.get(segment_id) else {
-                        tokio::fs::remove_dir_all(&segment_path).await?;
+                        log::debug!("Removing outdated segment {}", segment_path.display());
+
+                        tokio::fs::remove_dir_all(&segment_path)
+                            .await
+                            .map_err(|err| {
+                                CollectionError::service_error(format!(
+                                    "failed to remove outdated segment {}: {err}",
+                                    segment_path.display(),
+                                ))
+                            })?;
+
                         continue;
                     };
 
-                    for (file, &local_version) in &local_manifest.file_versions {
-                        let snapshot_version = snapshot_manifest.file_versions.get(file).copied();
+                    for (file, local_version) in local_manifest.file_versions() {
+                        let snapshot_version = snapshot_manifest.file_version(file);
 
                         let is_removed = snapshot_version.is_none();
 
                         let is_outdated = snapshot_version.is_none_or(|snapshot_version| {
-                            let local_version =
-                                local_version.or_segment_version(local_manifest.segment_version);
-
-                            let snapshot_version = snapshot_version
-                                .or_segment_version(snapshot_manifest.segment_version);
-
-                            // Compare versions to determine local file is outdated relative to snapshot
-                            local_version < snapshot_version
+                            let is_outdated = local_version < snapshot_version;
+                            let is_zero = local_version == 0 && snapshot_version == 0;
+                            is_outdated || is_zero
                         });
 
                         let is_rocksdb = file == Path::new(ROCKS_DB_VIRT_FILE);
@@ -290,19 +323,51 @@ impl ShardReplicaSet {
                             // *removed* from the snapshot
 
                             if !is_rocksdb && !is_payload_index_rocksdb {
-                                tokio::fs::remove_file(segment_path.join(file)).await?;
+                                let path = segment_path.join(file);
+
+                                log::debug!("Removing outdated segment file {}", path.display());
+
+                                tokio::fs::remove_file(&path).await.map_err(|err| {
+                                    CollectionError::service_error(format!(
+                                        "failed to remove outdated segment file {}: {err}",
+                                        path.display(),
+                                    ))
+                                })?;
                             }
                         } else if is_outdated {
                             // If `file` is a RocksDB "virtual" file, remove RocksDB from disk,
                             // if it was *updated* in or *removed* from the snapshot
 
                             if is_rocksdb {
+                                log::debug!(
+                                    "Destroying outdated RocksDB at {}",
+                                    segment_path.display(),
+                                );
+
                                 destroy_rocksdb(&segment_path)?;
                             } else if is_payload_index_rocksdb {
+                                log::debug!(
+                                    "Destroying outdated payload index RocksDB at {}/{}",
+                                    segment_path.display(),
+                                    PAYLOAD_INDEX_PATH,
+                                );
+
                                 destroy_rocksdb(&segment_path.join(PAYLOAD_INDEX_PATH))?;
                             }
                         }
                     }
+                }
+
+                let wal_path = LocalShard::wal_path(&self.shard_path);
+                if wal_path.is_dir() {
+                    log::debug!("Removing WAL {}", wal_path.display());
+
+                    tokio::fs::remove_dir_all(&wal_path).await.map_err(|err| {
+                        CollectionError::service_error(format!(
+                            "failed to remove WAL {}: {err}",
+                            wal_path.display(),
+                        ))
+                    })?;
                 }
             } else {
                 // Remove shard data but not configuration files
@@ -331,6 +396,11 @@ impl ShardReplicaSet {
                 local.replace(Shard::Local(new_local));
                 // remove shard_id initialization flag because shard is fully recovered
                 tokio::fs::remove_file(&shard_flag).await?;
+
+                if recovery_type.is_partial() {
+                    self.partial_snapshot_meta.snapshot_recovered();
+                }
+
                 Ok(true)
             }
 
@@ -365,5 +435,21 @@ impl ShardReplicaSet {
                 }
             }
         }
+    }
+
+    pub async fn get_partial_snapshot_manifest(&self) -> CollectionResult<SegmentManifests> {
+        self.local
+            .read()
+            .await
+            .as_ref()
+            .ok_or_else(|| {
+                CollectionError::bad_request(format!(
+                    "local shard {}:{} does not exist on peer {}",
+                    self.collection_id,
+                    self.shard_id,
+                    self.this_peer_id(),
+                ))
+            })?
+            .segment_manifests()
     }
 }

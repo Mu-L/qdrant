@@ -8,22 +8,28 @@ use std::thread;
 use atomic_refcell::{AtomicRef, AtomicRefCell};
 use bitvec::prelude::BitSlice;
 use bitvec::vec::BitVec;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 #[cfg(target_os = "linux")]
 use common::cpu::linux_low_thread_priority;
 use common::ext::BitSliceExt as _;
+use common::flags::FeatureFlags;
 use common::types::{PointOffsetType, ScoredPointOffset, TelemetryDetail};
-use itertools::EitherOrBoth;
+use itertools::{EitherOrBoth, Itertools as _};
 use log::debug;
 use memory::fadvise::clear_disk_cache;
 use parking_lot::Mutex;
+use rand::Rng;
 use rayon::ThreadPool;
 use rayon::prelude::*;
 
 #[cfg(feature = "gpu")]
 use super::gpu::gpu_devices_manager::LockedGpuDevice;
+use super::gpu::gpu_insert_context::GpuInsertContext;
+#[cfg(feature = "gpu")]
 use super::gpu::gpu_vector_storage::GpuVectorStorage;
 use super::graph_links::GraphLinksFormat;
+use super::links_container::LinksContainer;
 use crate::common::BYTES_IN_KB;
 use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
 use crate::common::operation_time_statistics::{
@@ -35,16 +41,17 @@ use crate::id_tracker::IdTrackerSS;
 use crate::index::hnsw_index::build_condition_checker::BuildConditionChecker;
 use crate::index::hnsw_index::config::HnswGraphConfig;
 #[cfg(feature = "gpu")]
+use crate::index::hnsw_index::gpu::gpu_graph_builder::GPU_MAX_VISITED_FLAGS_FACTOR;
+#[cfg(feature = "gpu")]
 use crate::index::hnsw_index::gpu::{get_gpu_groups_count, gpu_graph_builder::build_hnsw_on_gpu};
 use crate::index::hnsw_index::graph_layers::GraphLayers;
 use crate::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
-use crate::index::hnsw_index::point_scorer::FilteredScorer;
+use crate::index::hnsw_index::point_scorer::{BoxCow, FilteredScorer};
 use crate::index::query_estimator::adjust_to_available_vectors;
 use crate::index::sample_estimation::sample_check_cardinality;
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
 use crate::index::{PayloadIndex, VectorIndex, VectorIndexEnum};
-#[cfg(feature = "gpu")]
 use crate::payload_storage::FilterContext;
 use crate::segment_constructor::VectorIndexBuildArgs;
 use crate::telemetry::VectorIndexSearchesTelemetry;
@@ -187,9 +194,9 @@ impl HNSWIndex {
         self.quantized_vectors.clone()
     }
 
-    pub fn build(
+    pub fn build<R: Rng + ?Sized>(
         open_args: HnswIndexOpenArgs<'_>,
-        build_args: VectorIndexBuildArgs<'_>,
+        build_args: VectorIndexBuildArgs<'_, R>,
     ) -> OperationResult<Self> {
         if HnswGraphConfig::get_config_path(open_args.path).exists()
             || GraphLayers::get_path(open_args.path).exists()
@@ -214,6 +221,7 @@ impl HNSWIndex {
             permit,
             old_indices,
             gpu_device,
+            rng,
             stopped,
             feature_flags,
         } = build_args;
@@ -250,8 +258,8 @@ impl HNSWIndex {
         let old_index = old_indices
             .iter()
             .filter_map(|old_index| {
-                feature_flags.incremental_hnsw_building.then_some(())?;
                 OldIndexCandidate::evaluate(
+                    &feature_flags,
                     old_index,
                     &config,
                     &vector_storage_ref,
@@ -261,7 +269,6 @@ impl HNSWIndex {
             .max_by_key(|old_index| old_index.valid_points);
 
         // Build main index graph
-        let mut rng = rand::rng();
         let deleted_bitslice = vector_storage_ref.deleted_vector_bitslice();
 
         #[cfg(feature = "gpu")]
@@ -331,7 +338,7 @@ impl HNSWIndex {
             let level = old_index
                 .as_ref()
                 .and_then(|old_index| old_index.point_level(vector_id))
-                .unwrap_or_else(|| graph_layers_builder.get_random_layer(&mut rng));
+                .unwrap_or_else(|| graph_layers_builder.get_random_layer(rng));
             graph_layers_builder.set_levels(vector_id, level);
         }
 
@@ -370,30 +377,47 @@ impl HNSWIndex {
         } else {
             None
         };
-        #[cfg(not(feature = "gpu"))]
-        let gpu_vectors = None;
 
         if build_main_graph {
-            let timer = std::time::Instant::now();
-
             let mut ids = Vec::with_capacity(total_vector_count);
             let mut first_few_ids = Vec::with_capacity(SINGLE_THREADED_HNSW_BUILD_THRESHOLD);
 
             let mut ids_iter = id_tracker_ref.iter_ids_excluding(deleted_bitslice);
             if let Some(old_index) = old_index {
+                let timer = std::time::Instant::now();
+
+                let mut to_migrate = Vec::with_capacity(total_vector_count);
+
                 for vector_id in ids_iter {
-                    if let Some(links) = old_index.get_links(vector_id) {
-                        graph_layers_builder.add_new_point(vector_id, links);
+                    if let Some(old_offset) = old_index.new_to_old[vector_id as usize] {
+                        to_migrate.push(old_offset);
                     } else if first_few_ids.len() < SINGLE_THREADED_HNSW_BUILD_THRESHOLD {
                         first_few_ids.push(vector_id);
                     } else {
                         ids.push(vector_id);
                     }
                 }
+
+                // Internal operation. No measurements needed
+                let hw_accumulator = HwMeasurementAcc::disposable();
+
+                pool.install(|| {
+                    to_migrate.into_par_iter().try_for_each(|old_offset| {
+                        old_index.migrate_point(
+                            old_offset,
+                            &graph_layers_builder,
+                            hw_accumulator.get_counter_cell(),
+                        )
+                    })
+                })?;
+
+                debug!("Migrated in {:?}", timer.elapsed());
             } else {
                 first_few_ids.extend(ids_iter.by_ref().take(SINGLE_THREADED_HNSW_BUILD_THRESHOLD));
                 ids.extend(ids_iter);
             }
+
+            let timer = std::time::Instant::now();
 
             let insert_point = |vector_id| {
                 check_process_stopped(stopped)?;
@@ -402,22 +426,14 @@ impl HNSWIndex {
                 // No need to accumulate hardware, since this is an internal operation
                 let internal_hardware_counter = HardwareCounterCell::disposable();
 
-                let raw_scorer = if let Some(quantized_storage) = quantized_vectors_ref.as_ref() {
-                    quantized_storage.raw_scorer(
-                        vector,
-                        id_tracker_ref.deleted_point_bitslice(),
-                        vector_storage_ref.deleted_vector_bitslice(),
-                        internal_hardware_counter,
-                    )
-                } else {
-                    new_raw_scorer(
-                        vector,
-                        &vector_storage_ref,
-                        id_tracker_ref.deleted_point_bitslice(),
-                        internal_hardware_counter,
-                    )
-                }?;
-                let points_scorer = FilteredScorer::new(raw_scorer.as_ref(), None);
+                let points_scorer = FilteredScorer::new(
+                    vector,
+                    vector_storage_ref.deref(),
+                    quantized_vectors_ref.as_ref(),
+                    None,
+                    id_tracker_ref.deleted_point_bitslice(),
+                    internal_hardware_counter,
+                )?;
 
                 graph_layers_builder.link_new_point(vector_id, points_scorer);
 
@@ -437,9 +453,6 @@ impl HNSWIndex {
             drop(old_index);
         }
 
-        let visited_pool = VisitedPool::new();
-        let mut block_filter_list = visited_pool.get(total_vector_count);
-
         let payload_m = config.payload_m.unwrap_or(config.m);
 
         if payload_m > 0 {
@@ -455,6 +468,26 @@ impl HNSWIndex {
             } else {
                 BitVec::repeat(false, total_vector_count)
             };
+
+            let visited_pool = VisitedPool::new();
+            let mut block_filter_list = visited_pool.get(total_vector_count);
+
+            #[cfg(feature = "gpu")]
+            let mut gpu_insert_context = if let Some(gpu_vectors) = gpu_vectors.as_ref() {
+                Some(GpuInsertContext::new(
+                    gpu_vectors,
+                    get_gpu_groups_count(),
+                    payload_m,
+                    config.payload_m0.unwrap_or(config.m0),
+                    config.ef_construct,
+                    false,
+                    1..=GPU_MAX_VISITED_FLAGS_FACTOR,
+                )?)
+            } else {
+                None
+            };
+            #[cfg(not(feature = "gpu"))]
+            let mut gpu_insert_context = None;
 
             for (field, _) in payload_index_ref.indexed_fields() {
                 debug!("building additional index for field {}", &field);
@@ -485,11 +518,12 @@ impl HNSWIndex {
                         HNSW_USE_HEURISTIC,
                         false,
                     );
+
                     Self::build_filtered_graph(
                         id_tracker_ref.deref(),
                         &vector_storage_ref,
                         &quantized_vectors_ref,
-                        gpu_vectors.as_ref(),
+                        &mut gpu_insert_context,
                         &payload_index_ref,
                         &pool,
                         stopped,
@@ -560,7 +594,7 @@ impl HNSWIndex {
         id_tracker: &IdTrackerSS,
         vector_storage: &VectorStorageEnum,
         quantized_vectors: &Option<QuantizedVectors>,
-        #[allow(unused_variables)] gpu_vectors: Option<&GpuVectorStorage>,
+        #[allow(unused_variables)] gpu_insert_context: &mut Option<GpuInsertContext<'_>>,
         payload_index: &StructPayloadIndex,
         pool: &ThreadPool,
         stopped: &AtomicBool,
@@ -602,11 +636,10 @@ impl HNSWIndex {
             id_tracker,
             vector_storage,
             quantized_vectors,
-            gpu_vectors,
+            gpu_insert_context.as_mut(),
             graph_layers_builder,
             block_filter_list,
             &points_to_index,
-            deleted_bitslice,
             stopped,
         )? {
             *graph_layers_builder = gpu_constructed_graph;
@@ -622,26 +655,18 @@ impl HNSWIndex {
             // This hardware counter can be discarded, since it is only used for internal operations
             let internal_hardware_counter = HardwareCounterCell::disposable();
 
-            let raw_scorer = match quantized_vectors.as_ref() {
-                Some(quantized_storage) => quantized_storage.raw_scorer(
-                    vector,
-                    id_tracker.deleted_point_bitslice(),
-                    deleted_bitslice,
-                    internal_hardware_counter,
-                ),
-                None => new_raw_scorer(
-                    vector,
-                    vector_storage,
-                    id_tracker.deleted_point_bitslice(),
-                    internal_hardware_counter,
-                ),
-            }?;
             let block_condition_checker = BuildConditionChecker {
                 filter_list: block_filter_list,
                 current_point: block_point_id,
             };
-            let points_scorer =
-                FilteredScorer::new(raw_scorer.as_ref(), Some(&block_condition_checker));
+            let points_scorer = FilteredScorer::new(
+                vector,
+                vector_storage,
+                quantized_vectors.as_ref(),
+                Some(BoxCow::Borrowed(&block_condition_checker)),
+                id_tracker.deleted_point_bitslice(),
+                internal_hardware_counter,
+            )?;
 
             graph_layers_builder.link_new_point(block_point_id, points_scorer);
 
@@ -686,26 +711,32 @@ impl HNSWIndex {
             let vector = vector_storage.get_vector(vector_id);
             let vector = vector.as_vec_ref().into();
             let hardware_counter = HardwareCounterCell::disposable();
-            let raw_scorer = if let Some(quantized_storage) = quantized_vectors.as_ref() {
-                quantized_storage.raw_scorer(
-                    vector,
-                    id_tracker.deleted_point_bitslice(),
-                    vector_storage.deleted_vector_bitslice(),
-                    hardware_counter,
-                )
-            } else {
-                new_raw_scorer(
-                    vector,
-                    vector_storage,
-                    id_tracker.deleted_point_bitslice(),
-                    hardware_counter,
-                )
-            }?;
-            Ok((raw_scorer, None))
+            FilteredScorer::new(
+                vector,
+                vector_storage,
+                quantized_vectors.as_ref(),
+                None,
+                id_tracker.deleted_point_bitslice(),
+                hardware_counter,
+            )
+        };
+
+        let mut gpu_insert_context = if let Some(gpu_vectors) = gpu_vectors {
+            Some(GpuInsertContext::new(
+                gpu_vectors,
+                get_gpu_groups_count(),
+                graph_layers_builder.m(),
+                graph_layers_builder.m0(),
+                graph_layers_builder.ef_construct(),
+                false,
+                1..=GPU_MAX_VISITED_FLAGS_FACTOR,
+            )?)
+        } else {
+            None
         };
 
         Self::build_graph_on_gpu(
-            gpu_vectors,
+            gpu_insert_context.as_mut(),
             graph_layers_builder,
             id_tracker.iter_ids_excluding(deleted_bitslice),
             entry_points_num,
@@ -720,72 +751,58 @@ impl HNSWIndex {
         id_tracker: &IdTrackerSS,
         vector_storage: &VectorStorageEnum,
         quantized_vectors: &Option<QuantizedVectors>,
-        gpu_vectors: Option<&GpuVectorStorage>,
+        gpu_insert_context: Option<&mut GpuInsertContext<'_>>,
         graph_layers_builder: &GraphLayersBuilder,
         block_filter_list: &VisitedListHandle,
         points_to_index: &[PointOffsetType],
-        deleted_bitslice: &BitSlice,
         stopped: &AtomicBool,
     ) -> OperationResult<Option<GraphLayersBuilder>> {
-        let points_scorer_builder = |block_point_id| -> OperationResult<_> {
-            let vector = vector_storage.get_vector(block_point_id);
-            let vector = vector.as_vec_ref().into();
-            let hardware_counter = HardwareCounterCell::disposable();
-            let raw_scorer = match quantized_vectors.as_ref() {
-                Some(quantized_storage) => quantized_storage.raw_scorer(
-                    vector,
-                    id_tracker.deleted_point_bitslice(),
-                    deleted_bitslice,
-                    hardware_counter,
-                ),
-                None => new_raw_scorer(
-                    vector,
-                    vector_storage,
-                    id_tracker.deleted_point_bitslice(),
-                    hardware_counter,
-                ),
-            }?;
-            let block_condition_checker: Box<dyn FilterContext> = Box::new(BuildConditionChecker {
-                filter_list: block_filter_list,
-                current_point: block_point_id,
-            });
-            Ok((raw_scorer, Some(block_condition_checker)))
-        };
-
         Self::build_graph_on_gpu(
-            gpu_vectors,
+            gpu_insert_context,
             graph_layers_builder,
             points_to_index.iter().copied(),
             1,
-            points_scorer_builder,
+            |block_point_id| -> OperationResult<_> {
+                let vector = vector_storage.get_vector(block_point_id);
+                let vector = vector.as_vec_ref().into();
+                let hardware_counter = HardwareCounterCell::disposable();
+                let block_condition_checker: Box<dyn FilterContext> =
+                    Box::new(BuildConditionChecker {
+                        filter_list: block_filter_list,
+                        current_point: block_point_id,
+                    });
+                FilteredScorer::new(
+                    vector,
+                    vector_storage,
+                    quantized_vectors.as_ref(),
+                    Some(BoxCow::Boxed(block_condition_checker)),
+                    id_tracker.deleted_point_bitslice(),
+                    hardware_counter,
+                )
+            },
             stopped,
         )
     }
 
     #[cfg(feature = "gpu")]
     #[allow(clippy::too_many_arguments)]
-    fn build_graph_on_gpu<'a>(
-        gpu_vectors: Option<&GpuVectorStorage>,
+    fn build_graph_on_gpu<'a, 'b>(
+        gpu_insert_context: Option<&mut GpuInsertContext<'b>>,
         graph_layers_builder: &GraphLayersBuilder,
         points_to_index: impl Iterator<Item = PointOffsetType>,
         entry_points_num: usize,
-        points_scorer_builder: impl Fn(
-            PointOffsetType,
-        ) -> OperationResult<(
-            Box<dyn RawScorer + 'a>,
-            Option<Box<dyn FilterContext + 'a>>,
-        )> + Send
+        points_scorer_builder: impl Fn(PointOffsetType) -> OperationResult<FilteredScorer<'a>>
+        + Send
         + Sync,
         stopped: &AtomicBool,
     ) -> OperationResult<Option<GraphLayersBuilder>> {
-        if let Some(gpu_vectors) = gpu_vectors {
+        if let Some(gpu_insert_context) = gpu_insert_context {
             let gpu_constructed_graph = build_hnsw_on_gpu(
-                gpu_vectors,
+                gpu_insert_context,
                 graph_layers_builder,
                 get_gpu_groups_count(),
                 entry_points_num,
                 SINGLE_THREADED_HNSW_BUILD_THRESHOLD,
-                false,
                 points_to_index.collect::<Vec<_>>(),
                 points_scorer_builder,
                 stopped,
@@ -815,6 +832,9 @@ impl HNSWIndex {
         stopped: &AtomicBool,
     ) -> OperationResult<Option<GpuVectorStorage>> {
         use crate::index::hnsw_index::gpu::get_gpu_force_half_precision;
+        if vector_storage.total_vector_count() < SINGLE_THREADED_HNSW_BUILD_THRESHOLD {
+            return Ok(None);
+        }
 
         if let Some(gpu_device) = gpu_device {
             let gpu_vectors = GpuVectorStorage::new(
@@ -866,20 +886,18 @@ impl HNSWIndex {
             .deleted_points()
             .unwrap_or_else(|| id_tracker.deleted_point_bitslice());
 
-        let raw_scorer = Self::construct_search_scorer(
+        let hw_counter = vector_query_context.hardware_counter();
+        let filter_context = filter.map(|f| payload_index.filter_context(f, &hw_counter));
+        let points_scorer = Self::construct_search_scorer(
             vector,
             &vector_storage,
             quantized_vectors.as_ref(),
             deleted_points,
             params,
             vector_query_context.hardware_counter(),
+            filter_context,
         )?;
         let oversampled_top = Self::get_oversampled_top(quantized_vectors.as_ref(), params, top);
-
-        let hw_counter = vector_query_context.hardware_counter();
-
-        let filter_context = filter.map(|f| payload_index.filter_context(f, &hw_counter));
-        let points_scorer = FilteredScorer::new(raw_scorer.as_ref(), filter_context.as_deref());
 
         let search_result = self.graph.search(
             oversampled_top,
@@ -943,17 +961,18 @@ impl HNSWIndex {
 
         let is_stopped = vector_query_context.is_stopped();
 
-        let raw_scorer = Self::construct_search_scorer(
+        let points_scorer = Self::construct_search_scorer(
             vector,
             &vector_storage,
             quantized_vectors.as_ref(),
             deleted_points,
             params,
             vector_query_context.hardware_counter(),
+            None,
         )?;
         let oversampled_top = Self::get_oversampled_top(quantized_vectors.as_ref(), params, top);
 
-        let search_result = raw_scorer.peek_top_iter(points, oversampled_top, &is_stopped)?;
+        let search_result = points_scorer.peek_top_iter(points, oversampled_top, &is_stopped)?;
 
         let res = self.postprocess_search_result(
             search_result,
@@ -1069,22 +1088,17 @@ impl HNSWIndex {
         deleted_points: &'a BitSlice,
         params: Option<&SearchParams>,
         hardware_counter: HardwareCounterCell,
-    ) -> OperationResult<Box<dyn RawScorer + 'a>> {
+        filter_context: Option<Box<dyn FilterContext + 'a>>,
+    ) -> OperationResult<FilteredScorer<'a>> {
         let quantization_enabled = Self::is_quantized_search(quantized_storage, params);
-        match quantized_storage {
-            Some(quantized_storage) if quantization_enabled => quantized_storage.raw_scorer(
-                vector.to_owned(),
-                deleted_points,
-                vector_storage.deleted_vector_bitslice(),
-                hardware_counter,
-            ),
-            _ => new_raw_scorer(
-                vector.to_owned(),
-                vector_storage,
-                deleted_points,
-                hardware_counter,
-            ),
-        }
+        FilteredScorer::new(
+            vector.to_owned(),
+            vector_storage,
+            quantization_enabled.then_some(quantized_storage).flatten(),
+            filter_context.map(BoxCow::Boxed),
+            deleted_points,
+            hardware_counter,
+        )
     }
 
     fn get_oversampled_top(
@@ -1109,7 +1123,7 @@ impl HNSWIndex {
 
     fn postprocess_search_result(
         &self,
-        search_result: Vec<ScoredPointOffset>,
+        mut search_result: Vec<ScoredPointOffset>,
         vector: &QueryVector,
         params: Option<&SearchParams>,
         top: usize,
@@ -1131,25 +1145,24 @@ impl HNSWIndex {
                 .and_then(|q| q.rescore)
                 .unwrap_or(default_rescoring);
 
-        let mut postprocess_result = if rescore {
-            let raw_scorer = new_raw_scorer(
+        if rescore {
+            let mut scorer = FilteredScorer::new(
                 vector.to_owned(),
                 &vector_storage,
+                None,
+                None,
                 id_tracker.deleted_point_bitslice(),
                 hardware_counter,
             )?;
 
-            let mut ids_iterator = search_result.iter().map(|x| x.idx);
-            let mut re_scored = raw_scorer.score_points_unfiltered(&mut ids_iterator);
-
-            re_scored.sort_unstable();
-            re_scored.reverse();
-            re_scored
-        } else {
-            search_result
-        };
-        postprocess_result.truncate(top);
-        Ok(postprocess_result)
+            search_result = scorer
+                .score_points(&mut search_result.iter().map(|x| x.idx).collect_vec(), 0)
+                .collect();
+            search_result.sort_unstable();
+            search_result.reverse();
+        }
+        search_result.truncate(top);
+        Ok(search_result)
     }
 
     /// Read underlying data from disk into disk cache.
@@ -1375,16 +1388,18 @@ struct OldIndexCandidate<'a> {
     old_to_new: Vec<Option<PointOffsetType>>,
     /// Count of successfully mapped points.
     valid_points: usize,
+    /// Count of points that are missing in the new index.
+    missing_points: usize,
 }
 
-struct OldIndex<'a> {
+pub(super) struct OldIndex<'a> {
     index: AtomicRef<'a, HNSWIndex>,
     /// Mapping from old index to new index.
     /// `old_to_new[old_idx] == Some(new_idx)`.
-    old_to_new: Vec<Option<PointOffsetType>>,
+    pub old_to_new: Vec<Option<PointOffsetType>>,
     /// Mapping from new index to old index.
     /// `new_to_old[new_idx] == Some(old_idx)`.
-    new_to_old: Vec<Option<PointOffsetType>>,
+    pub new_to_old: Vec<Option<PointOffsetType>>,
     m: usize,
     m0: usize,
 }
@@ -1392,11 +1407,16 @@ struct OldIndex<'a> {
 impl<'a> OldIndexCandidate<'a> {
     /// Evaluate whether we can use the old index.
     fn evaluate(
+        feature_flags: &FeatureFlags,
         old_index: &'a Arc<AtomicRefCell<VectorIndexEnum>>,
         config: &HnswGraphConfig,
         vector_storage: &VectorStorageEnum,
         id_tracker: &IdTrackerSS,
     ) -> Option<Self> {
+        if !feature_flags.incremental_hnsw_building {
+            return None;
+        }
+
         let old_index = AtomicRef::filter_map(old_index.borrow(), |index| match index {
             VectorIndexEnum::Hnsw(old_index) => Some(old_index),
             _ => None,
@@ -1417,13 +1437,26 @@ impl<'a> OldIndexCandidate<'a> {
 
         if old_id_tracker.deleted_point_count() != 0 {
             // Old index has deleted points.
-            // FIXME: Not supported yet.
-            return None;
+            if !feature_flags.hnsw_healing {
+                return None;
+            }
         }
+
+        // Rough check whether the point is included in the old graph.
+        // If it's included, it almost certainly has at least one outgoing link at level 0.
+        let old_graph_has_point =
+            |id: PointOffsetType| old_index.graph.links.links(id, 0).next().is_some();
 
         // Build old_to_new mapping.
         let mut valid_points = 0;
+        let mut missing_points = 0;
         let mut old_to_new = vec![None; old_id_tracker.total_point_count()];
+
+        // Loop 1: Loop through all external ids, which present in either new or old index.
+        // So that we have 3 possible cases: `in old`, `in new`, `in both`.
+        //
+        // If we have `in both` case, we need to fill the `old_to_new` mapping.
+        // Otherwise, we are interested in counts of "missing" points - which absence in the new
         for item in itertools::merge_join_by(
             id_tracker.iter_from(None),
             old_id_tracker.iter_from(None),
@@ -1445,15 +1478,16 @@ impl<'a> OldIndexCandidate<'a> {
             // to reuse the graph built with this vector.
             // Thus, instead of checking `deleted_vector_bitslice`, we check
             // that the vector present in the graph, and it's value is the same.
-            let old_offset =
-                old_offset.filter(|&id| old_index.graph.links.links(id, 0).next().is_some());
+            let old_offset = old_offset.filter(|&id| old_graph_has_point(id));
 
             match (new_offset, old_offset) {
                 (_, None) => (),
                 (None, Some(_)) => {
                     // Vector was in the old index, but not in the new one.
-                    // FIXME: Not supported yet.
-                    return None;
+                    missing_points += 1;
+                    if !feature_flags.hnsw_healing {
+                        return None;
+                    }
                 }
                 (Some(new_offset), Some(old_offset)) => {
                     let new_vector = vector_storage.get_vector(new_offset);
@@ -1463,14 +1497,40 @@ impl<'a> OldIndexCandidate<'a> {
                         valid_points += 1;
                     } else {
                         // Vector is changed.
-                        // FIXME: Not supported yet.
-                        return None;
+                        missing_points += 1;
+                        if !feature_flags.hnsw_healing {
+                            return None;
+                        }
                     }
                 }
             }
         }
 
+        // Loop 2: find points that once were in the old index, but deleted in
+        // its id tracker.
+        // Since loop 1 doesn't detect deleted points, we need to check them explicitly.
+        for old_offset in 0..old_id_tracker.total_point_count() {
+            let old_offset = old_offset as PointOffsetType;
+            if old_id_tracker.is_deleted_point(old_offset) && old_graph_has_point(old_offset) {
+                missing_points += 1;
+                if !feature_flags.hnsw_healing {
+                    return None;
+                }
+            }
+        }
+
         if valid_points == 0 {
+            return None;
+        }
+
+        // Only allow up to 10% of points to be missing, otherwise healing
+        // would take longer than building from scratch.
+        let do_heal =
+            100 * (missing_points as u64) < 10 * (missing_points as u64 + valid_points as u64);
+        debug!(
+            "valid points: {valid_points}, missing points: {missing_points}, do_heal: {do_heal}"
+        );
+        if !do_heal {
             return None;
         }
 
@@ -1481,6 +1541,7 @@ impl<'a> OldIndexCandidate<'a> {
             index: old_index,
             old_to_new,
             valid_points,
+            missing_points,
         })
     }
 
@@ -1492,7 +1553,11 @@ impl<'a> OldIndexCandidate<'a> {
             }
         }
 
-        log::debug!("Reusing {} points from the old index", self.valid_points);
+        log::debug!(
+            "Reusing {} points from the old index, healing {} points",
+            self.valid_points,
+            self.missing_points,
+        );
 
         OldIndex {
             index: self.index,
@@ -1510,19 +1575,84 @@ impl OldIndex<'_> {
         Some(self.index.graph.links.point_level(old_id))
     }
 
-    fn get_links(&self, src_new: PointOffsetType) -> Option<Vec<Vec<PointOffsetType>>> {
-        let src_old = self.new_to_old[src_new as usize]?;
+    pub fn graph(&self) -> &GraphLayers {
+        &self.index.graph
+    }
 
+    /// Migrate point from old index to new index.
+    ///
+    /// This function considers two cases:
+    ///
+    /// - If all neighbors of the point planned to be migrated into new graph, we copy it as-is.
+    /// - If not, we need to "heal" it.
+    ///
+    fn migrate_point(
+        &self,
+        src_old: PointOffsetType,
+        builder: &GraphLayersBuilder,
+        hardware_counter: HardwareCounterCell,
+    ) -> OperationResult<()> {
         let links = &self.index.graph.links;
         let point_level = links.point_level(src_old);
 
-        let links = (0..=point_level).map(|level| {
-            links
-                .links(src_old, level)
-                .take(if level == 0 { self.m0 } else { self.m })
-                .filter_map(|dst_old| self.old_to_new[dst_old as usize])
-                .collect()
-        });
-        Some(links.collect())
+        let vector_storage = self.index.vector_storage.borrow();
+
+        // For the case of healing: we always heal before inserting new points.
+        // So old graph should contain all required information to heal the point.
+        let old_scorer = new_raw_scorer(
+            vector_storage.get_vector(src_old).as_vec_ref().into(),
+            &vector_storage,
+            hardware_counter,
+        )?;
+
+        let links_by_level: Vec<Vec<PointOffsetType>> = (0..=point_level)
+            .map(|level| self.migrate_point_on_level(src_old, level, builder, old_scorer.as_ref()))
+            .collect();
+
+        builder.add_new_point(self.old_to_new[src_old as usize].unwrap(), links_by_level);
+
+        Ok(())
+    }
+
+    fn migrate_point_on_level(
+        &self,
+        src_old: PointOffsetType,
+        level: usize,
+        builder: &GraphLayersBuilder,
+        old_scorer: &dyn RawScorer,
+    ) -> Vec<PointOffsetType> {
+        let links = &self.index.graph.links;
+
+        let level_m = if level == 0 { self.m0 } else { self.m };
+        let mut new_links = Vec::with_capacity(level_m);
+        let mut need_fixing = 0;
+
+        for link in links.links(src_old, level).take(level_m) {
+            if let Some(new_link) = self.old_to_new[link as usize] {
+                new_links.push(new_link);
+            } else {
+                need_fixing += 1;
+            }
+        }
+
+        // The "healing" case
+        if need_fixing > 0 {
+            // First: generate list of candidates
+            let shortcuts = builder
+                .search_shortcuts_on_level(src_old, level, old_scorer, self)
+                .into_iter_sorted();
+
+            // Second: process list of candidates with heuristic
+            let mut container = LinksContainer::with_capacity(level_m);
+            let new_scorer = |a, b| {
+                let a_old = self.new_to_old[a as usize].unwrap();
+                let b_old = self.new_to_old[b as usize].unwrap();
+                old_scorer.score_internal(a_old, b_old)
+            };
+            container.fill_from_sorted_with_heuristic(shortcuts, need_fixing, new_scorer);
+            new_links.extend_from_slice(container.links());
+        }
+
+        new_links
     }
 }

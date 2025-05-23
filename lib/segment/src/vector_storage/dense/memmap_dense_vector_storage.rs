@@ -183,6 +183,15 @@ impl<T: PrimitiveVectorElement> VectorStorage for MemmapDenseVectorStorage<T> {
         self.get_vector_opt(key).expect("vector not found")
     }
 
+    fn get_vector_sequential(&self, key: PointOffsetType) -> CowVector {
+        self.mmap_store
+            .as_ref()
+            .unwrap()
+            .get_vector_opt_sequential(key)
+            .map(|vector| T::slice_to_float_cow(vector.into()).into())
+            .expect("Vector not found")
+    }
+
     fn get_vector_opt(&self, key: PointOffsetType) -> Option<CowVector> {
         self.mmap_store
             .as_ref()
@@ -297,19 +306,18 @@ mod tests {
 
     use atomic_refcell::AtomicRefCell;
     use common::counter::hardware_counter::HardwareCounterCell;
-    use common::types::ScoredPointOffset;
     use memory::mmap_ops::transmute_to_u8_slice;
     use tempfile::Builder;
 
     use super::*;
-    use crate::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
     use crate::data_types::vectors::{DenseVector, QueryVector};
     use crate::fixtures::payload_context_fixture::FixtureIdTracker;
     use crate::id_tracker::id_tracker_base::IdTracker;
+    use crate::index::hnsw_index::point_scorer::FilteredScorer;
     use crate::types::{PointIdType, QuantizationConfig, ScalarQuantizationConfig};
-    use crate::vector_storage::dense::simple_dense_vector_storage::open_simple_dense_vector_storage;
+    use crate::vector_storage::dense::volatile_dense_vector_storage::new_volatile_dense_vector_storage;
     use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
-    use crate::vector_storage::{DEFAULT_STOPPED, new_raw_scorer_for_test};
+    use crate::vector_storage::{DEFAULT_STOPPED, new_raw_scorer};
 
     #[test]
     fn test_basic_persistence() {
@@ -338,16 +346,7 @@ mod tests {
         let hw_counter = HardwareCounterCell::new();
 
         {
-            let dir2 = Builder::new().prefix("db_dir").tempdir().unwrap();
-            let db = open_db(dir2.path(), &[DB_VECTOR_CF]).unwrap();
-            let mut storage2 = open_simple_dense_vector_storage(
-                db,
-                DB_VECTOR_CF,
-                4,
-                Distance::Dot,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+            let mut storage2 = new_volatile_dense_vector_storage(4, Distance::Dot);
             {
                 storage2
                     .insert_vector(0, points[0].as_slice().into(), &hw_counter)
@@ -378,16 +377,7 @@ mod tests {
         borrowed_id_tracker.drop(PointIdType::NumId(2)).unwrap();
 
         {
-            let dir2 = Builder::new().prefix("db_dir").tempdir().unwrap();
-            let db = open_db(dir2.path(), &[DB_VECTOR_CF]).unwrap();
-            let mut storage2 = open_simple_dense_vector_storage(
-                db,
-                DB_VECTOR_CF,
-                4,
-                Distance::Dot,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+            let mut storage2 = new_volatile_dense_vector_storage(4, Distance::Dot);
             {
                 storage2
                     .insert_vector(3, points[3].as_slice().into(), &hw_counter)
@@ -411,19 +401,18 @@ mod tests {
 
         assert_eq!(stored_ids, [0, 1, 3, 4]);
 
-        let raw_scorer = new_raw_scorer_for_test(
+        let scorer = FilteredScorer::new_for_test(
             points[2].as_slice().into(),
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
-        )
-        .unwrap();
-        let res = raw_scorer.peek_top_all(2, &DEFAULT_STOPPED).unwrap();
+        );
+        let res = scorer.peek_top_all(2, &DEFAULT_STOPPED).unwrap();
 
         assert_eq!(res.len(), 2);
 
         assert_ne!(res[0].idx, 2);
 
-        let res = raw_scorer
+        let res = scorer
             .peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 2, &DEFAULT_STOPPED)
             .unwrap();
 
@@ -450,16 +439,7 @@ mod tests {
         let hw_counter = HardwareCounterCell::new();
 
         {
-            let dir2 = Builder::new().prefix("db_dir").tempdir().unwrap();
-            let db = open_db(dir2.path(), &[DB_VECTOR_CF]).unwrap();
-            let mut storage2 = open_simple_dense_vector_storage(
-                db,
-                DB_VECTOR_CF,
-                4,
-                Distance::Dot,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+            let mut storage2 = new_volatile_dense_vector_storage(4, Distance::Dot);
             {
                 points.iter().enumerate().for_each(|(i, vec)| {
                     storage2
@@ -495,12 +475,11 @@ mod tests {
 
         let vector = vec![0.0, 1.0, 1.1, 1.0];
         let query = vector.as_slice().into();
-        let scorer = new_raw_scorer_for_test(
+        let scorer = FilteredScorer::new_for_test(
             query,
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
-        )
-        .unwrap();
+        );
 
         let closest = scorer
             .peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5, &DEFAULT_STOPPED)
@@ -523,12 +502,11 @@ mod tests {
         let vector = vec![1.0, 0.0, 0.0, 0.0];
         let query = vector.as_slice().into();
 
-        let scorer = new_raw_scorer_for_test(
+        let scorer = FilteredScorer::new_for_test(
             query,
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
-        )
-        .unwrap();
+        );
         let closest = scorer
             .peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5, &DEFAULT_STOPPED)
             .unwrap();
@@ -548,12 +526,11 @@ mod tests {
 
         let vector = vec![1.0, 0.0, 0.0, 0.0];
         let query = vector.as_slice().into();
-        let scorer = new_raw_scorer_for_test(
+        let scorer = FilteredScorer::new_for_test(
             query,
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
-        )
-        .unwrap();
+        );
         let closest = scorer.peek_top_all(5, &DEFAULT_STOPPED).unwrap();
         assert!(closest.is_empty(), "must have no results, all deleted");
     }
@@ -578,16 +555,7 @@ mod tests {
         let hw_counter = HardwareCounterCell::new();
 
         {
-            let dir2 = Builder::new().prefix("db_dir").tempdir().unwrap();
-            let db = open_db(dir2.path(), &[DB_VECTOR_CF]).unwrap();
-            let mut storage2 = open_simple_dense_vector_storage(
-                db,
-                DB_VECTOR_CF,
-                4,
-                Distance::Dot,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+            let mut storage2 = new_volatile_dense_vector_storage(4, Distance::Dot);
             {
                 points.iter().enumerate().for_each(|(i, vec)| {
                     storage2
@@ -615,12 +583,11 @@ mod tests {
 
         let vector = vec![0.0, 1.0, 1.1, 1.0];
         let query = vector.as_slice().into();
-        let scorer = new_raw_scorer_for_test(
+        let scorer = FilteredScorer::new_for_test(
             query,
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
-        )
-        .unwrap();
+        );
         let closest = scorer
             .peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5, &DEFAULT_STOPPED)
             .unwrap();
@@ -661,16 +628,7 @@ mod tests {
         let hw_counter = HardwareCounterCell::new();
 
         {
-            let dir2 = Builder::new().prefix("db_dir").tempdir().unwrap();
-            let db = open_db(dir2.path(), &[DB_VECTOR_CF]).unwrap();
-            let mut storage2 = open_simple_dense_vector_storage(
-                db,
-                DB_VECTOR_CF,
-                4,
-                Distance::Dot,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+            let mut storage2 = new_volatile_dense_vector_storage(4, Distance::Dot);
             {
                 for (i, vec) in points.iter().enumerate() {
                     storage2
@@ -689,18 +647,17 @@ mod tests {
 
         let vector = vec![-1.0, -1.0, -1.0, -1.0];
         let query = vector.as_slice().into();
-        let query_points: Vec<PointOffsetType> = vec![0, 2, 4];
 
-        let scorer = new_raw_scorer_for_test(
+        let mut scorer = FilteredScorer::new_for_test(
             query,
             &storage,
             borrowed_id_tracker.deleted_point_bitslice(),
-        )
-        .unwrap();
+        );
 
-        let mut res = vec![ScoredPointOffset { idx: 0, score: 0. }; query_points.len()];
-        let res_count = scorer.score_points(&query_points, &mut res);
-        res.resize(res_count, ScoredPointOffset { idx: 0, score: 0. });
+        let mut query_points: Vec<PointOffsetType> = vec![0, 2, 4];
+        let res = scorer
+            .score_points(&mut query_points, 0)
+            .collect::<Vec<_>>();
 
         assert_eq!(res.len(), 3);
         assert_eq!(res[0].idx, 0);
@@ -740,23 +697,12 @@ mod tests {
             vec![1.0, 1.0, 0.0, 1.0],
             vec![1.0, 0.0, 0.0, 0.0],
         ];
-        let id_tracker = Arc::new(AtomicRefCell::new(FixtureIdTracker::new(points.len())));
         let mut storage = open_memmap_vector_storage(dir.path(), 4, Distance::Dot).unwrap();
-        let borrowed_id_tracker = id_tracker.borrow_mut();
 
         let hw_counter = HardwareCounterCell::new();
 
         {
-            let dir2 = Builder::new().prefix("db_dir").tempdir().unwrap();
-            let db = open_db(dir2.path(), &[DB_VECTOR_CF]).unwrap();
-            let mut storage2 = open_simple_dense_vector_storage(
-                db,
-                DB_VECTOR_CF,
-                4,
-                Distance::Dot,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+            let mut storage2 = new_volatile_dense_vector_storage(4, Distance::Dot);
             {
                 for (i, vec) in points.iter().enumerate() {
                     storage2
@@ -788,20 +734,11 @@ mod tests {
         let query: QueryVector = [0.5, 0.5, 0.5, 0.5].into();
 
         let scorer_quant = quantized_vectors
-            .raw_scorer(
-                query.clone(),
-                borrowed_id_tracker.deleted_point_bitslice(),
-                storage.deleted_vector_bitslice(),
-                hardware_counter,
-            )
+            .raw_scorer(query.clone(), hardware_counter)
             .unwrap();
 
-        let scorer_orig = new_raw_scorer_for_test(
-            query.clone(),
-            &storage,
-            borrowed_id_tracker.deleted_point_bitslice(),
-        )
-        .unwrap();
+        let scorer_orig =
+            new_raw_scorer(query.clone(), &storage, HardwareCounterCell::new()).unwrap();
 
         for i in 0..5 {
             let quant = scorer_quant.score_point(i);
@@ -822,19 +759,9 @@ mod tests {
         assert_eq!(quantization_files, quantized_vectors.files());
         let hardware_counter = HardwareCounterCell::new();
         let scorer_quant = quantized_vectors
-            .raw_scorer(
-                query.clone(),
-                borrowed_id_tracker.deleted_point_bitslice(),
-                storage.deleted_vector_bitslice(),
-                hardware_counter,
-            )
+            .raw_scorer(query.clone(), hardware_counter)
             .unwrap();
-        let scorer_orig = new_raw_scorer_for_test(
-            query,
-            &storage,
-            borrowed_id_tracker.deleted_point_bitslice(),
-        )
-        .unwrap();
+        let scorer_orig = new_raw_scorer(query, &storage, HardwareCounterCell::new()).unwrap();
 
         for i in 0..5 {
             let quant = scorer_quant.score_point(i);

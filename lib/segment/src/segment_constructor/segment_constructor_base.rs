@@ -10,16 +10,21 @@ use common::budget::ResourcePermit;
 use common::flags::FeatureFlags;
 use io::storage_version::StorageVersion;
 use log::info;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
+#[cfg(feature = "rocksdb")]
+use parking_lot::RwLock;
+use rand::Rng;
+#[cfg(feature = "rocksdb")]
 use rocksdb::DB;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::rocksdb_builder::RocksDbBuilder;
 use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
-use crate::common::rocksdb_wrapper::{DB_MAPPING_CF, DB_VECTOR_CF, open_db};
 use crate::data_types::vectors::DEFAULT_VECTOR_NAME;
 use crate::id_tracker::immutable_id_tracker::ImmutableIdTracker;
 use crate::id_tracker::mutable_id_tracker::MutableIdTracker;
+#[cfg(feature = "rocksdb")]
 use crate::id_tracker::simple_id_tracker::SimpleIdTracker;
 use crate::id_tracker::{IdTracker, IdTrackerEnum, IdTrackerSS};
 use crate::index::VectorIndexEnum;
@@ -49,6 +54,7 @@ use crate::vector_storage::dense::appendable_dense_vector_storage::{
 use crate::vector_storage::dense::memmap_dense_vector_storage::{
     open_memmap_vector_storage, open_memmap_vector_storage_byte, open_memmap_vector_storage_half,
 };
+#[cfg(feature = "rocksdb")]
 use crate::vector_storage::dense::simple_dense_vector_storage::{
     open_simple_dense_byte_vector_storage, open_simple_dense_half_vector_storage,
     open_simple_dense_vector_storage,
@@ -59,13 +65,13 @@ use crate::vector_storage::multi_dense::appendable_mmap_multi_dense_vector_stora
     open_appendable_memmap_multi_vector_storage_byte,
     open_appendable_memmap_multi_vector_storage_half,
 };
+#[cfg(feature = "rocksdb")]
 use crate::vector_storage::multi_dense::simple_multi_dense_vector_storage::{
     open_simple_multi_dense_vector_storage, open_simple_multi_dense_vector_storage_byte,
     open_simple_multi_dense_vector_storage_half,
 };
 use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
 use crate::vector_storage::sparse::mmap_sparse_vector_storage::MmapSparseVectorStorage;
-use crate::vector_storage::sparse::simple_sparse_vector_storage::open_simple_sparse_vector_storage;
 use crate::vector_storage::{VectorStorage, VectorStorageEnum};
 
 pub const PAYLOAD_INDEX_PATH: &str = "payload_index";
@@ -76,7 +82,7 @@ fn sp<T>(t: T) -> Arc<AtomicRefCell<T>> {
     Arc::new(AtomicRefCell::new(t))
 }
 
-fn get_vector_name_with_prefix(prefix: &str, vector_name: &VectorName) -> String {
+pub fn get_vector_name_with_prefix(prefix: &str, vector_name: &VectorName) -> String {
     if !vector_name.is_empty() {
         format!("{prefix}-{vector_name}")
     } else {
@@ -96,23 +102,32 @@ pub fn get_vector_index_path(segment_path: &Path, vector_name: &VectorName) -> P
 }
 
 pub(crate) fn open_vector_storage(
-    database: &Arc<RwLock<DB>>,
+    #[cfg(feature = "rocksdb")] db_builder: &mut RocksDbBuilder,
     vector_config: &VectorDataConfig,
-    stopped: &AtomicBool,
+    #[cfg(feature = "rocksdb")] stopped: &AtomicBool,
     vector_storage_path: &Path,
-    vector_name: &VectorName,
+    #[cfg(feature = "rocksdb")] vector_name: &VectorName,
 ) -> OperationResult<VectorStorageEnum> {
     let storage_element_type = vector_config.datatype.unwrap_or_default();
 
     match vector_config.storage_type {
-        // In memory
+        // In memory - RocksDB disabled
+        #[cfg(not(feature = "rocksdb"))]
+        VectorStorageType::Memory => Err(OperationError::service_error(
+            "Failed to load 'Memory' storage type, RocksDB disabled in this Qdrant version",
+        )),
+
+        // In memory - RocksDB enabled
+        #[cfg(feature = "rocksdb")]
         VectorStorageType::Memory => {
+            use crate::common::rocksdb_wrapper::DB_VECTOR_CF;
+
             let db_column_name = get_vector_name_with_prefix(DB_VECTOR_CF, vector_name);
 
             if let Some(multi_vec_config) = &vector_config.multivector_config {
                 match storage_element_type {
                     VectorStorageDatatype::Float32 => open_simple_multi_dense_vector_storage(
-                        database.clone(),
+                        db_builder.require()?,
                         &db_column_name,
                         vector_config.size,
                         vector_config.distance,
@@ -120,7 +135,7 @@ pub(crate) fn open_vector_storage(
                         stopped,
                     ),
                     VectorStorageDatatype::Uint8 => open_simple_multi_dense_vector_storage_byte(
-                        database.clone(),
+                        db_builder.require()?,
                         &db_column_name,
                         vector_config.size,
                         vector_config.distance,
@@ -128,7 +143,7 @@ pub(crate) fn open_vector_storage(
                         stopped,
                     ),
                     VectorStorageDatatype::Float16 => open_simple_multi_dense_vector_storage_half(
-                        database.clone(),
+                        db_builder.require()?,
                         &db_column_name,
                         vector_config.size,
                         vector_config.distance,
@@ -139,21 +154,21 @@ pub(crate) fn open_vector_storage(
             } else {
                 match storage_element_type {
                     VectorStorageDatatype::Float32 => open_simple_dense_vector_storage(
-                        database.clone(),
+                        db_builder.require()?,
                         &db_column_name,
                         vector_config.size,
                         vector_config.distance,
                         stopped,
                     ),
                     VectorStorageDatatype::Uint8 => open_simple_dense_byte_vector_storage(
-                        database.clone(),
+                        db_builder.require()?,
                         &db_column_name,
                         vector_config.size,
                         vector_config.distance,
                         stopped,
                     ),
                     VectorStorageDatatype::Float16 => open_simple_dense_half_vector_storage(
-                        database.clone(),
+                        db_builder.require()?,
                         &db_column_name,
                         vector_config.size,
                         vector_config.distance,
@@ -306,45 +321,20 @@ pub(crate) fn open_vector_storage(
     }
 }
 
-pub(crate) fn open_segment_db(
+pub(crate) fn create_payload_storage(
+    db_builder: &mut RocksDbBuilder,
     segment_path: &Path,
     config: &SegmentConfig,
-) -> OperationResult<Arc<RwLock<DB>>> {
-    let vector_db_names: Vec<String> = config
-        .vector_data
-        .keys()
-        .map(|vector_name| get_vector_name_with_prefix(DB_VECTOR_CF, vector_name))
-        .chain(
-            config
-                .sparse_vector_data
-                .iter()
-                .filter(|(_, sparse_vector_config)| {
-                    matches!(
-                        sparse_vector_config.storage_type,
-                        SparseVectorStorageType::OnDisk
-                    )
-                })
-                .map(|(vector_name, _)| get_vector_name_with_prefix(DB_VECTOR_CF, vector_name)),
-        )
-        .collect();
-    open_db(segment_path, &vector_db_names)
-        .map_err(|err| OperationError::service_error(format!("RocksDB open error: {err}")))
-}
-
-pub(crate) fn create_payload_storage(
-    database: Arc<RwLock<DB>>,
-    config: &SegmentConfig,
-    path: &Path,
 ) -> OperationResult<PayloadStorageEnum> {
     let payload_storage = match config.payload_storage_type {
         PayloadStorageType::InMemory => {
-            PayloadStorageEnum::from(SimplePayloadStorage::open(database)?)
+            PayloadStorageEnum::from(SimplePayloadStorage::open(db_builder.require()?)?)
         }
         PayloadStorageType::OnDisk => {
-            PayloadStorageEnum::from(OnDiskPayloadStorage::open(database)?)
+            PayloadStorageEnum::from(OnDiskPayloadStorage::open(db_builder.require()?)?)
         }
         PayloadStorageType::Mmap => {
-            PayloadStorageEnum::from(MmapPayloadStorage::open_or_create(path)?)
+            PayloadStorageEnum::from(MmapPayloadStorage::open_or_create(segment_path)?)
         }
     };
     Ok(payload_storage)
@@ -354,6 +344,7 @@ pub(crate) fn create_mutable_id_tracker(segment_path: &Path) -> OperationResult<
     MutableIdTracker::open(segment_path)
 }
 
+#[cfg(feature = "rocksdb")]
 pub(crate) fn create_rocksdb_id_tracker(
     database: Arc<RwLock<DB>>,
 ) -> OperationResult<SimpleIdTracker> {
@@ -378,12 +369,13 @@ pub(crate) struct VectorIndexOpenArgs<'a> {
     pub quantized_vectors: Arc<AtomicRefCell<Option<QuantizedVectors>>>,
 }
 
-pub struct VectorIndexBuildArgs<'a> {
+pub struct VectorIndexBuildArgs<'a, R: Rng + ?Sized> {
     pub permit: Arc<ResourcePermit>,
     /// Vector indices from other segments, used to speed up index building.
     /// May or may not contain the same vectors.
     pub old_indices: &'a [Arc<AtomicRefCell<VectorIndexEnum>>],
     pub gpu_device: Option<&'a LockedGpuDevice<'a>>,
+    pub rng: &'a mut R,
     pub stopped: &'a AtomicBool,
     pub feature_flags: FeatureFlags,
 }
@@ -416,10 +408,10 @@ pub(crate) fn open_vector_index(
     })
 }
 
-pub(crate) fn build_vector_index(
+pub(crate) fn build_vector_index<R: Rng + ?Sized>(
     vector_config: &VectorDataConfig,
     open_args: VectorIndexOpenArgs,
-    build_args: VectorIndexBuildArgs,
+    build_args: VectorIndexBuildArgs<R>,
 ) -> OperationResult<VectorIndexEnum> {
     let VectorIndexOpenArgs {
         path,
@@ -506,16 +498,20 @@ pub(crate) fn create_sparse_vector_index(
 }
 
 pub(crate) fn create_sparse_vector_storage(
-    database: Arc<RwLock<DB>>,
+    #[cfg(feature = "rocksdb")] db_builder: &mut RocksDbBuilder,
     path: &Path,
-    vector_name: &VectorName,
+    #[cfg(feature = "rocksdb")] vector_name: &VectorName,
     storage_type: &SparseVectorStorageType,
-    stopped: &AtomicBool,
+    #[cfg(feature = "rocksdb")] stopped: &AtomicBool,
 ) -> OperationResult<VectorStorageEnum> {
     match storage_type {
+        #[cfg(feature = "rocksdb")]
         SparseVectorStorageType::OnDisk => {
+            use crate::common::rocksdb_wrapper::DB_VECTOR_CF;
+            use crate::vector_storage::sparse::simple_sparse_vector_storage::open_simple_sparse_vector_storage;
+
             let db_column_name = get_vector_name_with_prefix(DB_VECTOR_CF, vector_name);
-            open_simple_sparse_vector_storage(database, &db_column_name, stopped)
+            open_simple_sparse_vector_storage(db_builder.require()?, &db_column_name, stopped)
         }
         SparseVectorStorageType::Mmap => {
             let mmap_storage = MmapSparseVectorStorage::open_or_create(path)?;
@@ -530,56 +526,24 @@ fn create_segment(
     config: &SegmentConfig,
     stopped: &AtomicBool,
 ) -> OperationResult<Segment> {
-    let database = open_segment_db(segment_path, config)?;
+    let mut db_builder = RocksDbBuilder::new(segment_path, config)?;
+
     let payload_storage = sp(create_payload_storage(
-        database.clone(),
-        config,
+        &mut db_builder,
         segment_path,
+        config,
     )?);
 
     let appendable_flag = config.is_appendable();
 
-    let mutable_id_tracker =
+    let use_mutable_id_tracker =
         appendable_flag || !ImmutableIdTracker::mappings_file_path(segment_path).is_file();
-
-    let id_tracker = if mutable_id_tracker {
-        // Determine whether we use the new (file based) or old (RocksDB) mutable ID tracker
-        // Decide based on the feature flag and state on disk
-        let use_new_mutable_tracker = {
-            // New ID tracker is enabled by default, but we still use the old tracker if we have
-            // any mappings stored in RocksDB
-            // TODO(1.15 or later): remove this check and use new mutable ID tracker unconditionally
-            let db = database.read();
-            match db.cf_handle(DB_MAPPING_CF) {
-                Some(cf_handle) => {
-                    let count = db
-                        .property_int_value_cf(cf_handle, rocksdb::properties::ESTIMATE_NUM_KEYS)
-                        .map_err(|err| {
-                            OperationError::service_error(format!(
-                                "Failed to get estimated number of keys from RocksDB: {err}"
-                            ))
-                        })?
-                        .unwrap_or_default();
-                    count == 0
-                }
-                None => true,
-            }
-        };
-
-        if use_new_mutable_tracker {
-            sp(IdTrackerEnum::MutableIdTracker(create_mutable_id_tracker(
-                segment_path,
-            )?))
-        } else {
-            sp(IdTrackerEnum::RocksDbIdTracker(create_rocksdb_id_tracker(
-                database.clone(),
-            )?))
-        }
-    } else {
-        sp(IdTrackerEnum::ImmutableIdTracker(
-            create_immutable_id_tracker(segment_path)?,
-        ))
-    };
+    let id_tracker = create_segment_id_tracker(
+        use_mutable_id_tracker,
+        segment_path,
+        #[cfg(feature = "rocksdb")]
+        &mut db_builder,
+    )?;
 
     let mut vector_storages = HashMap::new();
 
@@ -588,10 +552,13 @@ fn create_segment(
 
         // Select suitable vector storage type based on configuration
         let vector_storage = sp(open_vector_storage(
-            &database,
+            #[cfg(feature = "rocksdb")]
+            &mut db_builder,
             vector_config,
+            #[cfg(feature = "rocksdb")]
             stopped,
             &vector_storage_path,
+            #[cfg(feature = "rocksdb")]
             vector_name,
         )?);
 
@@ -603,10 +570,13 @@ fn create_segment(
 
         // Select suitable sparse vector storage type based on configuration
         let vector_storage = sp(create_sparse_vector_storage(
-            database.clone(),
+            #[cfg(feature = "rocksdb")]
+            &mut db_builder,
             &vector_storage_path,
+            #[cfg(feature = "rocksdb")]
             vector_name,
             &sparse_config.storage_type,
+            #[cfg(feature = "rocksdb")]
             stopped,
         )?);
 
@@ -729,9 +699,61 @@ fn create_segment(
         payload_storage,
         segment_config: config.clone(),
         error_status: None,
-        database,
+        database: db_builder.build(),
         flush_thread: Mutex::new(None),
     })
+}
+
+fn create_segment_id_tracker(
+    mutable_id_tracker: bool,
+    segment_path: &Path,
+    #[cfg(feature = "rocksdb")] db_builder: &mut RocksDbBuilder,
+) -> OperationResult<Arc<AtomicRefCell<IdTrackerEnum>>> {
+    if !mutable_id_tracker {
+        return Ok(sp(IdTrackerEnum::ImmutableIdTracker(
+            create_immutable_id_tracker(segment_path)?,
+        )));
+    }
+
+    // Determine whether we use the new (file based) or old (RocksDB) mutable ID tracker
+    // Decide based on the feature flag and state on disk
+    #[cfg(feature = "rocksdb")]
+    {
+        use crate::common::rocksdb_wrapper::DB_MAPPING_CF;
+
+        let use_rocksdb_mutable_tracker = if let Some(db) = db_builder.read() {
+            // New ID tracker is enabled by default, but we still use the old tracker if we have
+            // any mappings stored in RocksDB
+            //
+            // TODO(1.15 or later): remove this check and use new mutable ID tracker unconditionally
+            if let Some(cf) = db.cf_handle(DB_MAPPING_CF) {
+                let count = db
+                    .property_int_value_cf(cf, rocksdb::properties::ESTIMATE_NUM_KEYS)
+                    .map_err(|err| {
+                        OperationError::service_error(format!(
+                            "Failed to get estimated number of keys from RocksDB: {err}"
+                        ))
+                    })?
+                    .unwrap_or_default();
+
+                count > 0
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if use_rocksdb_mutable_tracker {
+            return Ok(sp(IdTrackerEnum::RocksDbIdTracker(
+                create_rocksdb_id_tracker(db_builder.require()?)?,
+            )));
+        }
+    }
+
+    Ok(sp(IdTrackerEnum::MutableIdTracker(
+        create_mutable_id_tracker(segment_path)?,
+    )))
 }
 
 pub fn load_segment(path: &Path, stopped: &AtomicBool) -> OperationResult<Option<Segment>> {

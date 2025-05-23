@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::mem::{size_of, size_of_val};
 use std::path::{Path, PathBuf};
 
@@ -80,7 +80,7 @@ impl ImmutableIdTracker {
 
     /// Loads a `CompressedPointMappings` from the given reader. Applies an optional filter of deleted items
     /// to prevent allocating unneeded data.
-    fn load_mapping<R: Read>(
+    fn load_mapping<R: BufRead>(
         mut reader: R,
         deleted: Option<BitVec>,
     ) -> OperationResult<CompressedPointMappings> {
@@ -198,7 +198,6 @@ impl ImmutableIdTracker {
             Self::write_entry(&mut writer, internal_id, external_id)?;
         }
 
-        writer.flush()?;
         Ok(())
     }
 
@@ -319,8 +318,8 @@ impl ImmutableIdTracker {
 
         // Write mappings to disk.
         let file = File::create(Self::mappings_file_path(path))?;
-        let writer = BufWriter::new(&file);
-        Self::store_mapping(&mappings, writer)?;
+        let mut writer = BufWriter::new(&file);
+        Self::store_mapping(&mappings, &mut writer)?;
         file.sync_all()?;
 
         deleted_wrapper.flusher()()?;

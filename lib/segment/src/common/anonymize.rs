@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 
 use chrono::{DateTime, Utc};
+use ecow::{EcoString, eco_format};
 pub use macros::Anonymize;
 use uuid::Uuid;
 
@@ -115,6 +116,14 @@ impl Anonymize for String {
         let mut hasher = DefaultHasher::new();
         self.hash(&mut hasher);
         hasher.finish().to_string()
+    }
+}
+
+impl Anonymize for EcoString {
+    fn anonymize(&self) -> Self {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        eco_format!("{}", hasher.finish())
     }
 }
 

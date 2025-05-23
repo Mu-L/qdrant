@@ -13,6 +13,7 @@ use common::tar_ext::BuilderExt;
 use futures::{Future, StreamExt, TryStreamExt as _, stream};
 use itertools::Itertools;
 use segment::common::validate_snapshot_archive::open_snapshot_archive_with_validation;
+use segment::data_types::segment_manifest::SegmentManifests;
 use segment::types::{ShardKey, SnapshotFormat};
 use shard_mapping::ShardKeyMapping;
 use tokio::runtime::Handle;
@@ -141,10 +142,7 @@ impl ShardHolder {
         Ok(())
     }
 
-    pub async fn drop_and_remove_shard(
-        &mut self,
-        shard_id: ShardId,
-    ) -> Result<(), CollectionError> {
+    pub async fn drop_and_remove_shard(&mut self, shard_id: ShardId) -> CollectionResult<()> {
         if let Some(replica_set) = self.shards.remove(&shard_id) {
             let shard_path = replica_set.shard_path.clone();
             drop(replica_set);
@@ -169,7 +167,7 @@ impl ShardHolder {
         &mut self,
         shard_id: ShardId,
         shard_key: &ShardKey,
-    ) -> Result<(), CollectionError> {
+    ) -> CollectionResult<()> {
         self.key_mapping.write_optional(|key_mapping| {
             if !key_mapping.contains_key(shard_key) {
                 return None;
@@ -189,7 +187,7 @@ impl ShardHolder {
         shard_id: ShardId,
         shard: ShardReplicaSet,
         shard_key: Option<ShardKey>,
-    ) -> Result<(), CollectionError> {
+    ) -> CollectionResult<()> {
         self.shards.insert(shard_id, shard);
         self.rings
             .entry(shard_key.clone())
@@ -216,7 +214,7 @@ impl ShardHolder {
         Ok(())
     }
 
-    pub async fn remove_shard_key(&mut self, shard_key: &ShardKey) -> Result<(), CollectionError> {
+    pub async fn remove_shard_key(&mut self, shard_key: &ShardKey) -> CollectionResult<()> {
         let mut remove_shard_ids = Vec::new();
 
         self.key_mapping.write_optional(|key_mapping| {
@@ -274,7 +272,7 @@ impl ShardHolder {
         shard_ids: HashSet<ShardId>,
         shard_key_mapping: ShardKeyMapping,
         extra_shards: HashMap<ShardId, ShardReplicaSet>,
-    ) -> Result<(), CollectionError> {
+    ) -> CollectionResult<()> {
         self.shards.extend(extra_shards.into_iter());
 
         let all_shard_ids = self.shards.keys().cloned().collect::<HashSet<_>>();
@@ -858,6 +856,7 @@ impl ShardHolder {
                 snapshot_temp_dir.path(),
                 &tar,
                 SnapshotFormat::Regular,
+                None,
                 false,
             )
             .await?;
@@ -892,6 +891,7 @@ impl ShardHolder {
         shard: OwnedRwLockReadGuard<ShardHolder, ShardReplicaSet>,
         collection_name: &str,
         shard_id: ShardId,
+        manifest: Option<SegmentManifests>,
         temp_dir: &Path,
     ) -> CollectionResult<SnapshotStream> {
         // - `snapshot_temp_dir` and `temp_file` are handled by `tempfile`
@@ -922,6 +922,7 @@ impl ShardHolder {
                     snapshot_temp_dir.path(),
                     &tar,
                     SnapshotFormat::Streamable,
+                    manifest,
                     false,
                 )
                 .await?;
@@ -958,6 +959,7 @@ impl ShardHolder {
     pub async fn restore_shard_snapshot(
         &self,
         snapshot_path: &Path,
+        recovery_type: RecoveryType,
         collection_path: &Path,
         collection_name: &str,
         shard_id: ShardId,
@@ -1015,10 +1017,20 @@ impl ShardHolder {
 
         task.await??;
 
+        let _partial_snapshot_search_lock = self
+            .take_partial_snapshot_search_write_lock(shard_id, recovery_type)
+            .await?;
+
         // `ShardHolder::recover_local_shard_from` is *not* cancel safe
         // (see `ShardReplicaSet::restore_local_replica_from`)
         let recovered = self
-            .recover_local_shard_from(snapshot_temp_dir.path(), collection_path, shard_id, cancel)
+            .recover_local_shard_from(
+                snapshot_temp_dir.path(),
+                recovery_type,
+                collection_path,
+                shard_id,
+                cancel,
+            )
             .await?;
 
         if !recovered {
@@ -1036,6 +1048,7 @@ impl ShardHolder {
     pub async fn recover_local_shard_from(
         &self,
         snapshot_shard_path: &Path,
+        recovery_type: RecoveryType,
         collection_path: &Path,
         shard_id: ShardId,
         cancel: cancel::CancellationToken,
@@ -1050,15 +1063,47 @@ impl ShardHolder {
 
         // `ShardReplicaSet::restore_local_replica_from` is *not* cancel safe
         let res = replica_set
-            .restore_local_replica_from(
-                snapshot_shard_path,
-                RecoveryType::Full,
-                collection_path,
-                cancel,
-            )
+            .restore_local_replica_from(snapshot_shard_path, recovery_type, collection_path, cancel)
             .await?;
 
         Ok(res)
+    }
+
+    pub fn try_take_partial_snapshot_recovery_lock(
+        &self,
+        shard_id: ShardId,
+        recovery_type: RecoveryType,
+    ) -> CollectionResult<Option<tokio::sync::OwnedMutexGuard<()>>> {
+        match recovery_type {
+            RecoveryType::Full => Ok(None),
+            RecoveryType::Partial => {
+                let lock = self
+                    .get_shard(shard_id)
+                    .ok_or_else(|| shard_not_found_error(shard_id))?
+                    .try_take_partial_snapshot_recovery_lock()?;
+
+                Ok(Some(lock))
+            }
+        }
+    }
+
+    async fn take_partial_snapshot_search_write_lock(
+        &self,
+        shard_id: ShardId,
+        recovery_type: RecoveryType,
+    ) -> CollectionResult<Option<tokio::sync::OwnedRwLockWriteGuard<()>>> {
+        match recovery_type {
+            RecoveryType::Full => Ok(None),
+            RecoveryType::Partial => {
+                let lock = self
+                    .get_shard(shard_id)
+                    .ok_or_else(|| shard_not_found_error(shard_id))?
+                    .take_search_write_lock()
+                    .await;
+
+                Ok(Some(lock))
+            }
+        }
     }
 
     /// # Cancel safety

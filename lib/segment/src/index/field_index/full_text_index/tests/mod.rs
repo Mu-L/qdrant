@@ -167,7 +167,7 @@ fn test_prefix_search(#[case] immutable: bool) {
     };
 
     let db = open_db_with_existing_cf(&temp_dir.path().join("test_db")).unwrap();
-    let mut index = FullTextIndex::builder(db.clone(), config.clone(), "text")
+    let mut index = FullTextIndex::builder_rocksdb(db.clone(), config.clone(), "text")
         .make_empty()
         .unwrap();
 
@@ -182,13 +182,13 @@ fn test_prefix_search(#[case] immutable: bool) {
     }
 
     if immutable {
-        index = FullTextIndex::new_memory(db, config, "text", false);
+        index = FullTextIndex::new_rocksdb(db, config, "text", false);
         index.load().unwrap();
     }
 
     let res: Vec<_> = index.query("ROBO", &hw_counter).collect();
 
-    let query = index.parse_query("ROBO", &hw_counter);
+    let query = index.parse_query("ROBO", &hw_counter).unwrap();
 
     for idx in res.iter().copied() {
         assert!(index.check_match(&query, idx, &hw_counter));
@@ -197,12 +197,7 @@ fn test_prefix_search(#[case] immutable: bool) {
     assert_eq!(res.len(), 3);
 
     let res: Vec<_> = index.query("q231", &hw_counter).collect();
+    assert!(res.is_empty());
 
-    let query = index.parse_query("q231", &hw_counter);
-
-    for idx in [1, 2, 3] {
-        assert!(!index.check_match(&query, idx, &hw_counter));
-    }
-
-    assert_eq!(res.len(), 0);
+    assert!(index.parse_query("q231", &hw_counter).is_none());
 }

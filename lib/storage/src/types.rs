@@ -104,6 +104,9 @@ pub struct StorageConfig {
     #[validate(nested)]
     #[serde(default)]
     pub collection: Option<CollectionConfigDefaults>,
+    /// Maximum number of collections to allow in the cluster.
+    #[serde(default)]
+    pub max_collections: Option<usize>,
 }
 
 impl StorageConfig {
@@ -123,6 +126,7 @@ impl StorageConfig {
             self.performance.outgoing_shard_transfers_limit,
             self.snapshots_path.clone(),
             self.snapshots_config.clone(),
+            common::defaults::search_thread_count(self.performance.max_search_threads),
         )
     }
 }

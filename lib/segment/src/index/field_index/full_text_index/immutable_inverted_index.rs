@@ -4,6 +4,7 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 
 use super::inverted_index::InvertedIndex;
+use super::mmap_inverted_index::MmapInvertedIndex;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::index::field_index::full_text_index::compressed_posting::compressed_posting_list::CompressedPostingList;
 use crate::index::field_index::full_text_index::inverted_index::{ParsedQuery, TokenId};
@@ -52,20 +53,13 @@ impl InvertedIndex for ImmutableInvertedIndex {
         let postings_opt: Option<Vec<_>> = query
             .tokens
             .iter()
-            .map(|&token_id| match token_id {
-                None => None,
-                // if a ParsedQuery token was given an index, then it must exist in the vocabulary
-                Some(idx) => {
-                    let postings = self.postings.get(idx as usize);
-                    postings
-                }
-            })
+            .map(|&token_id| self.postings.get(token_id as usize))
             .collect();
 
         let postings = match postings_opt {
             // All tokens must have postings and query must not be empty
             Some(postings) if !postings.is_empty() => postings,
-            _ => return Box::new(vec![].into_iter()),
+            _ => return Box::new(std::iter::empty()),
         };
 
         let posting_readers: Vec<_> = postings
@@ -100,23 +94,20 @@ impl InvertedIndex for ImmutableInvertedIndex {
         point_id: PointOffsetType,
         _: &HardwareCounterCell,
     ) -> bool {
-        if parsed_query.tokens.contains(&None) {
+        if parsed_query.tokens.is_empty() {
             return false;
         }
+
         // check presence of the document
         if self.values_is_empty(point_id) {
             return false;
         }
 
         // Check that all tokens are in document
-        parsed_query
-            .tokens
-            .iter()
-            // unwrap crash safety: all tokens exist in the vocabulary if it passes the above check
-            .all(|query_token| {
-                let postings = &self.postings[query_token.unwrap() as usize];
-                postings.reader().contains(point_id)
-            })
+        parsed_query.tokens.iter().all(|token_id| {
+            let postings = &self.postings[*token_id as usize];
+            postings.reader().contains(point_id)
+        })
     }
 
     fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
@@ -148,9 +139,8 @@ impl From<MutableInvertedIndex> for ImmutableInvertedIndex {
             .postings
             .into_iter()
             .enumerate()
-            .filter_map(|(orig_token, posting)| match posting {
-                Some(posting) if posting.len() > 0 => Some((orig_token, posting)),
-                _ => None,
+            .filter_map(|(orig_token, posting)| {
+                (!posting.is_empty()).then_some((orig_token, posting))
             })
             .enumerate()
             .map(|(new_token, (orig_token, posting))| {
@@ -184,6 +174,68 @@ impl From<MutableInvertedIndex> for ImmutableInvertedIndex {
                 .map(|doc| doc.as_ref().map(|doc| doc.len()))
                 .collect(),
             points_count: index.points_count,
+        }
+    }
+}
+
+impl From<&MmapInvertedIndex> for ImmutableInvertedIndex {
+    fn from(index: &MmapInvertedIndex) -> Self {
+        let hw_counter = HardwareCounterCell::disposable();
+
+        // Keep only tokens that have non-empty postings
+        let (postings, orig_to_new_token): (Vec<_>, HashMap<_, _>) = index
+            .iter_postings(&hw_counter)
+            .enumerate()
+            .filter_map(|(orig_token, posting)| {
+                posting
+                    .filter(|posting| !posting.is_empty())
+                    .map(|posting| (orig_token, posting))
+            })
+            .enumerate()
+            .map(|(new_token, (orig_token, posting))| {
+                (posting, (orig_token as TokenId, new_token as TokenId))
+            })
+            .unzip();
+
+        // Update vocab entries
+        let mut vocab: HashMap<String, TokenId> = index
+            .iter_vocab()
+            .filter_map(|(key, orig_token)| {
+                orig_to_new_token
+                    .get(orig_token)
+                    .map(|new_token| (key.to_string(), *new_token))
+            })
+            .collect();
+
+        let postings: Vec<CompressedPostingList> = postings
+            .into_iter()
+            .map(|postings| CompressedPostingList::new(&postings.to_vec()))
+            .collect();
+        vocab.shrink_to_fit();
+
+        debug_assert!(
+            postings.len() == vocab.len(),
+            "postings and vocab must be the same size",
+        );
+
+        let point_to_tokens_count = index
+            .point_to_tokens_count
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| {
+                debug_assert!(
+                    index.is_active(i as u32) || n == 0,
+                    "deleted point index {i} has {n} tokens, expected zero",
+                );
+                (n > 0).then_some(n)
+            })
+            .collect();
+
+        ImmutableInvertedIndex {
+            postings,
+            vocab,
+            point_to_tokens_count,
+            points_count: index.points_count(),
         }
     }
 }

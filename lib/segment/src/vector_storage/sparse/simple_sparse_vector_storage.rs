@@ -22,8 +22,6 @@ use crate::vector_storage::bitvec::bitvec_set_deleted;
 use crate::vector_storage::common::StoredRecord;
 use crate::vector_storage::{SparseVectorStorage, VectorStorage, VectorStorageEnum};
 
-pub const SPARSE_VECTOR_DISTANCE: Distance = Distance::Dot;
-
 type StoredSparseVector = StoredRecord<SparseVector>;
 
 /// In-memory vector storage with on-update persistence using `store`
@@ -151,6 +149,11 @@ impl SparseVectorStorage for SimpleSparseVectorStorage {
         Ok(record.vector)
     }
 
+    fn get_sparse_sequential(&self, key: PointOffsetType) -> OperationResult<SparseVector> {
+        // Already in memory, so no sequential optimizations available.
+        self.get_sparse(key)
+    }
+
     fn get_sparse_opt(&self, key: PointOffsetType) -> OperationResult<Option<SparseVector>> {
         let bin_key = bincode::serialize(&key)
             .map_err(|_| OperationError::service_error("Cannot serialize sparse vector key"))?;
@@ -171,7 +174,7 @@ impl SparseVectorStorage for SimpleSparseVectorStorage {
 
 impl VectorStorage for SimpleSparseVectorStorage {
     fn distance(&self) -> Distance {
-        SPARSE_VECTOR_DISTANCE
+        super::SPARSE_VECTOR_DISTANCE
     }
 
     fn datatype(&self) -> VectorStorageDatatype {
@@ -189,6 +192,11 @@ impl VectorStorage for SimpleSparseVectorStorage {
     fn get_vector(&self, key: PointOffsetType) -> CowVector {
         let vector = self.get_vector_opt(key);
         vector.unwrap_or_else(CowVector::default_sparse)
+    }
+
+    fn get_vector_sequential(&self, key: PointOffsetType) -> CowVector {
+        // In memory, so no sequential read optimization.
+        self.get_vector(key)
     }
 
     /// Get vector by key, if it exists.

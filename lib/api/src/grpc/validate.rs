@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use common::validation::{validate_range_generic, validate_shard_different_peers};
+use segment::data_types::index::validate_integer_index_params;
 use validator::{Validate, ValidationError, ValidationErrors};
 
 use super::qdrant as grpc;
@@ -195,6 +196,25 @@ impl Validate for grpc::condition::ConditionOneOf {
     }
 }
 
+impl Validate for grpc::update_operation::Update {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        use grpc::update_operation::Update;
+        match self {
+            Update::Sync(op) => op.validate(),
+            Update::Upsert(op) => op.validate(),
+            Update::Delete(op) => op.validate(),
+            Update::UpdateVectors(op) => op.validate(),
+            Update::DeleteVectors(op) => op.validate(),
+            Update::SetPayload(op) => op.validate(),
+            Update::OverwritePayload(op) => op.validate(),
+            Update::DeletePayload(op) => op.validate(),
+            Update::ClearPayload(op) => op.validate(),
+            Update::CreateFieldIndex(op) => op.validate(),
+            Update::DeleteFieldIndex(op) => op.validate(),
+        }
+    }
+}
+
 impl Validate for grpc::FieldCondition {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let grpc::FieldCondition {
@@ -315,6 +335,69 @@ impl Validate for super::qdrant::query_enum::Query {
     }
 }
 
+impl Validate for super::qdrant::query::Variant {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            grpc::query::Variant::Nearest(q) => q.validate(),
+            grpc::query::Variant::Recommend(q) => q.validate(),
+            grpc::query::Variant::Discover(q) => q.validate(),
+            grpc::query::Variant::Context(q) => q.validate(),
+            grpc::query::Variant::Formula(q) => q.validate(),
+            grpc::query::Variant::Sample(_)
+            | grpc::query::Variant::Fusion(_)
+            | grpc::query::Variant::OrderBy(_) => Ok(()),
+        }
+    }
+}
+
+impl Validate for super::qdrant::vector_input::Variant {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            grpc::vector_input::Variant::Id(_)
+            | grpc::vector_input::Variant::Dense(_)
+            | grpc::vector_input::Variant::Document(_)
+            | grpc::vector_input::Variant::Image(_)
+            | grpc::vector_input::Variant::Object(_) => Ok(()),
+            grpc::vector_input::Variant::Sparse(sparse_vector) => sparse_vector.validate(),
+            grpc::vector_input::Variant::MultiDense(multi_dense_vector) => {
+                multi_dense_vector.validate()
+            }
+        }
+    }
+}
+
+impl Validate for super::qdrant::expression::Variant {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            grpc::expression::Variant::Constant(_) => Ok(()),
+            grpc::expression::Variant::Variable(_) => Ok(()),
+            grpc::expression::Variant::Condition(condition) => condition.validate(),
+            grpc::expression::Variant::GeoDistance(_) => Ok(()),
+            grpc::expression::Variant::Datetime(_) => Ok(()),
+            grpc::expression::Variant::DatetimeKey(_) => Ok(()),
+            grpc::expression::Variant::Mult(mult_expression) => mult_expression.validate(),
+            grpc::expression::Variant::Sum(sum_expression) => sum_expression.validate(),
+            grpc::expression::Variant::Div(div_expression) => div_expression.validate(),
+            grpc::expression::Variant::Neg(expression) => expression.validate(),
+            grpc::expression::Variant::Abs(expression) => expression.validate(),
+            grpc::expression::Variant::Sqrt(expression) => expression.validate(),
+            grpc::expression::Variant::Pow(pow_expression) => pow_expression.validate(),
+            grpc::expression::Variant::Exp(expression) => expression.validate(),
+            grpc::expression::Variant::Log10(expression) => expression.validate(),
+            grpc::expression::Variant::Ln(expression) => expression.validate(),
+            grpc::expression::Variant::ExpDecay(decay_params_expression) => {
+                decay_params_expression.validate()
+            }
+            grpc::expression::Variant::GaussDecay(decay_params_expression) => {
+                decay_params_expression.validate()
+            }
+            grpc::expression::Variant::LinDecay(decay_params_expression) => {
+                decay_params_expression.validate()
+            }
+        }
+    }
+}
+
 /// Validate that GeoLineString has at least 4 points and is closed.
 pub fn validate_geo_polygon_line_helper(line: &grpc::GeoLineString) -> Result<(), ValidationError> {
     let points = &line.points;
@@ -362,6 +445,35 @@ pub fn validate_timestamp(ts: &prost_wkt_types::Timestamp) -> Result<(), Validat
     )?;
     validate_range_generic(ts.nanos, Some(0), Some(999_999_999))?;
     Ok(())
+}
+
+impl Validate for super::qdrant::payload_index_params::IndexParams {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            grpc::payload_index_params::IndexParams::KeywordIndexParams(_) => Ok(()),
+            grpc::payload_index_params::IndexParams::IntegerIndexParams(integer_index_params) => {
+                integer_index_params.validate()
+            }
+            grpc::payload_index_params::IndexParams::FloatIndexParams(_) => Ok(()),
+            grpc::payload_index_params::IndexParams::GeoIndexParams(_) => Ok(()),
+            grpc::payload_index_params::IndexParams::TextIndexParams(_) => Ok(()),
+            grpc::payload_index_params::IndexParams::BoolIndexParams(_) => Ok(()),
+            grpc::payload_index_params::IndexParams::DatetimeIndexParams(_) => Ok(()),
+            grpc::payload_index_params::IndexParams::UuidIndexParams(_) => Ok(()),
+        }
+    }
+}
+
+impl Validate for super::qdrant::IntegerIndexParams {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let super::qdrant::IntegerIndexParams {
+            lookup,
+            range,
+            is_principal: _,
+            on_disk: _,
+        } = &self;
+        validate_integer_index_params(lookup, range)
+    }
 }
 
 #[cfg(test)]

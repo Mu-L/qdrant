@@ -1,5 +1,6 @@
 use std::cmp::max;
-use std::fs::create_dir_all;
+use std::fs::{File, create_dir_all};
+use std::io::BufReader;
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 
@@ -101,7 +102,7 @@ impl<T: Sized + Copy + 'static> ChunkedMmapVectors<T> {
 
     fn load_config(config_file: &Path) -> OperationResult<Option<ChunkedMmapConfig>> {
         if config_file.exists() {
-            let file = std::fs::File::open(config_file)?;
+            let file = BufReader::new(File::open(config_file)?);
             let config: ChunkedMmapConfig = serde_json::from_reader(file)?;
             Ok(Some(config))
         } else {
@@ -357,6 +358,10 @@ impl<T: Sized + Copy + 'static> ChunkedVectorStorage<T> for ChunkedMmapVectors<T
         ChunkedMmapVectors::get(self, key, false)
     }
 
+    fn get_sequential(&self, key: VectorOffsetType) -> Option<&[T]> {
+        ChunkedMmapVectors::get(self, key, true)
+    }
+
     #[inline]
     fn files(&self) -> Vec<PathBuf> {
         ChunkedMmapVectors::files(self)
@@ -400,6 +405,11 @@ impl<T: Sized + Copy + 'static> ChunkedVectorStorage<T> for ChunkedMmapVectors<T
     #[inline]
     fn get_many(&self, key: VectorOffsetType, count: usize) -> Option<&[T]> {
         ChunkedMmapVectors::get_many(self, key, count, false)
+    }
+
+    #[inline]
+    fn get_many_sequential(&self, key: VectorOffsetType, count: usize) -> Option<&[T]> {
+        ChunkedMmapVectors::get_many(self, key, count, true)
     }
 
     #[inline]
